@@ -1,0 +1,2 @@
+algorithmns	topologies	demand_downscales	num_demands	iterations	cutoff	scales	k	target	paths	weibull_scale
+["TEAVAR"]	["B4"]	[2.0]	1	1	0.0001	[1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2, 3.4, 3.6, 3.8, 4.0]	12	0	KSP	0.001
