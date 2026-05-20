@@ -1,0 +1,35 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Generated experiment outputs
+project/data/raw/
+project/code_py/data/raw/
+toy_experiment/results/
+outputs/
+
+# Local reference material not intended for publication
+project/reference/
+
+# Third-party reference project kept locally only
+teavar/

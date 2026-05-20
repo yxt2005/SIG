@@ -1,0 +1,342 @@
+﻿
+# 算力路由概述
+
+新工作概括为：**把 TeaVaR 从“WAN 中固定源宿流的概率保证流量工程”，扩展为“地理分布式算力网络中的任务放置 + 两阶段风险感知路由联合优化”**。TeaVaR 的核心是：在故障概率模型下，针对给定可用性阈值 (\beta)，用 CVaR 最小化来分配多路径带宽，从而显式调节“利用率—可用性”权衡；你们的工作则进一步引入了**执行节点选择**、**算力约束**以及**去程/回程两阶段通信**，因此决策对象从“给定流的带宽分配”扩展成了“任务放置与两阶段流量分配的联合决策”。  
+
+### 1. 问题场景
+
+TeaVaR 面向的是 WAN 流量工程场景：网络拓扑、链路容量、流需求以及每个流的一组固定 tunnels 都已给定，优化器要做的是在这些预先给定的 tunnels 上分配带宽，并在故障场景概率模型下保证指定的可用性水平。它的输入是 flows、demands、tunnels、scenarios 和 scenario probabilities，输出是每个 flow 的可允许带宽及其在各 tunnel 上的分配。 
+
+新工作场景更丰富：网络中既有转发节点，也有具备算力的执行节点；每个任务 (i) 除了源节点 (s_i)、目的节点 (d_i) 外，还需要在候选执行节点集合 (\mathcal M_i) 中选一个执行位置；一旦选定执行节点 (m)，通信就自然分成两段：输入数据从 (s_i) 送到 (m) 的去程，以及计算完成后从 (m) 送到 (d_i) 的回程。也就是说，**源宿结构本身不是预先固定的，而是由任务放置共同决定的**。这正是与 TeaVaR 的第一个本质区别。 
+
+进一步说，TeaVaR 的“对象”是 flow；你们的“对象”是 task。TeaVaR 只关心网络侧的可用性与吞吐保证，而你们还要同时考虑执行节点的多维资源容量，因此本质上是一个**算力—网络耦合决策问题**，这与 Copo 所强调的“上层做放置、下层做性能响应”的联合优化框架更接近，但你们在下层引入的是 TeaVaR 式的概率风险控制，而不是 Copo 的简单链路负载均衡。 
+
+### 2. 优化目标
+
+TeaVaR 的目标是：给定可用性阈值 (\beta)，通过最小化 CVaR 势函数
+[
+F_\beta(x,\alpha)=\alpha+\frac{1}{1-\beta}\mathbb E[(L(x,y)-\alpha)^+]
+]
+来获得对网络流的概率保证；它强调的是“对显式 (\beta) 的优化”，而不是像 FFC 那样用“最多容忍 (k) 条链路故障”这种粗粒度方式间接刻画可用性。
+
+我们的新工作则是一个标准双层目标结构。上层目标是在正常状态下联合优化算力侧与链路侧资源效率，即最小化
+[
+\lambda U_{link}^{\max}+(1-\lambda)U_{node}^{\max},
+]
+其中 (U_{node}^{\max}) 衡量执行节点侧的最大资源利用率，(U_{link}^{\max}) 衡量正常状态下的最大链路利用率；下层目标则是在给定放置结果后，最小化 TeaVaR 风险目标，使两阶段通信在故障场景下具有显式可用性保证。换句话说，**TeaVaR 在你们这里不再是最终整个问题的全部目标，而是被提升为“下层风险响应机制”**。 
+
+因此，与 TeaVaR 相比，你们的目标有三点扩展：
+
+第一，TeaVaR 只优化网络流带宽分配；你们同时优化**任务放置 + 路由分配**。
+第二，TeaVaR 主要追求显式可用性下的吞吐/公平性保证；你们还显式优化**正常状态的算力均衡与链路均衡**。
+第三，TeaVaR 中每个 flow 只有一类传输需求；你们的任务损失由**去程与回程两阶段共同决定**。  
+
+### 3. 实现思路
+
+`teavar.py` 的核心思路非常清楚：先预计算“场景—隧道可用矩阵” `X[s,t]` 和“隧道—链路关联矩阵” `L[t,e]`，再在 Gurobi 中建立一个干净的 LP，变量只有路径带宽分配、(\alpha)、每场景损失和系统损失，最后直接最小化 TeaVaR 势函数。也就是说，它把“路径可用性判断”都挪到了建模前处理阶段，而没有在优化模型中动态判断。这个思想完全可以继承。
+
+但实现结构上，不应直接照搬成一个单层 TE 模型，而应采用：
+
+**外层任务放置搜索 + 内层固定放置下的 TeaVaR 路由 LP**
+
+这样的两层实现。
+
+原因是：固定放置 (y) 后，每个任务的执行节点就唯一确定了，此时原来理论模型中的 (x_{i,m,p}^{in},x_{i,m,q}^{out}) 可以在代码里简化成只对“被选执行节点对应路径集”上的变量，避免把所有候选节点的路径都同时放进 Gurobi。这样做既保留了双层建模语义，又能显著降低实现复杂度。 
+
+具体来说，可以把实现分成三块：
+
+* **预处理模块**：生成候选路径、路径—链路关联矩阵、场景—路径可用矩阵、场景概率；
+* **下层求解器**：给定一个放置方案 (y)，建立两阶段 TeaVaR LP，求出去程/回程流量分配、风险值、各场景损失以及正常状态链路负载；
+* **外层搜索器**：在小规模实验阶段，先穷举或局部搜索任务放置，对每个候选 (y) 调用一次下层求解器，再根据 (\lambda U_{link}^{\max}+(1-\lambda)U_{node}^{\max}) 选最优。
+
+这样，你们的方法与 TeaVaR 的关系就非常清楚：**TeaVaR 提供的是“固定源宿、多路径、概率故障、CVaR 风险控制”的下层求解内核；你们的新工作在其外部增加了执行节点选择与算力约束，并在其内部把单阶段流路由扩展成了两阶段任务通信路由。**   
+
+一句话总结：
+
+**TeaVaR 是“风险感知的 WAN 流量分配”；你们的新工作是“面向算力网络任务执行的任务放置—两阶段风险路由联合优化”，其中 TeaVaR 被扩展为下层风险控制机制，而不是整个问题的全部内容。**
+
+# 实验思路
+
+## 第一阶段：在B4拓扑上利用自定义数据对模型正确性进行验证
+
+### 1. 基于建模实现模型算法
+
+可以先采用“外层任务放置搜索、内层风险感知路径分配”的两层实现框架。
+
+首先，基于 B4 拓扑、自定义任务需求以及候选执行节点集合，为每个任务—候选节点对预生成去程与回程候选路径（或者预处理节点之间的候选路径，在确定执行节点后，根据节点对索引即可），并预计算路径与链路的关联关系以及故障场景下的路径可用性（这一部分可以参考TEAVAR）。
+
+随后，在外层枚举或搜索任务放置方案，即为每个任务选择一个执行节点；在给定放置结果后，内层仅保留被选执行节点对应的去程与回程路径集合，参考 TeaVaR 的实现方式构建线性规划模型，对两阶段流量进行多路径分配，并通过 CVaR 风险目标保证故障场景下的通信可用性。
+
+最后，对每个放置方案计算正常状态下的最大节点利用率与最大链路利用率，并以其加权组合作为综合评价指标，从而选出最优的任务放置与路径分配联合方案。
+
+### 2. 设计小规模实验验证模型正确性：设计实验文件与实验入口文件，实现算法调用与结果输出；
+
+如何生成任务、故障场景及其概率可以参考TEAVAR;
+
+实验输出可以包括：每个任务的执行节点选择、去程与回程的路径分配、每个场景下的损失值、正常状态下的最大链路利用率与最大节点利用率等。
+
+# 代码要求
+
+1. 代码结构清晰，模块划分合理，注释充分，便于理解和维护。
+
+2. 编程语言使用 Python，利用 Gurobi 求解器进行线性规划求解。
+
+3. 内层优化模型应基于线性规划，尽量参考 TeaVaR 的实现方式。
+
+4. 避免过多的兜底、退化代码，确保每个模块的输入输出清晰，错误处理合理。
+
+5. 各部分文件命名规范，便于识别其功能和关系。算法文件、实验文件、实验入口文件位置参考TEAVAR项目结构；
+
+6. 参考TEAVAR的代码风格和实现细节，部分通用函数如命令行解析函数、数据加载函数、结果输出函数、拓扑加载函数等参考TEAVAR,放在parse、utils、simulation等包中。
+
+
+# 第一阶段实现细化（落地版）
+
+下面给出可直接编码的第一阶段方案，目标是先在 `B4 + 小规模自定义任务` 上验证模型正确性与流程完整性。
+
+## 1. 第一阶段目标边界（建议锁定）
+
+1. 仅做**静态单时隙**优化，不引入任务到达/离开动态过程。  
+2. 外层先支持两种策略：`enumerate`（小规模穷举）和 `greedy`（任务逐个放置）。  
+3. 内层固定为 LP（Gurobi），不引入整数路由变量。  
+4. 先使用链路独立故障 + cutoff 场景剪枝（沿用 TEAVAR 思路）。  
+5. 结果以“模型正确性可解释”为优先，不追求大规模性能最优。
+
+## 2. 模型算法输入/输出（函数级）
+
+### 2.1 统一输入对象 `Phase1Input`
+
+建议把所有输入在预处理后封装为一个结构体/字典，字段至少包括：
+
+- `nodes`: 节点列表（如 `1..N`）  
+- `edges`: 有向边列表 `[(u,v)]`  
+- `capacity[e]`: 链路容量  
+- `edge_fail_prob[e]`: 链路故障概率  
+- `tasks`: 任务列表，元素字段：
+  - `task_id`
+  - `s_i, d_i`
+  - `b_in, b_out`
+  - `w_i[k]`（多维算力需求）
+  - `candidate_ms`（候选执行节点）
+- `compute_capacity[m][k]`: 计算节点多维容量  
+- `path_sets[(src,dst)]`: 节点对候选路径（每条路径是 edge_idx 列表）  
+- `P_in[(i,m)]`, `P_out[(i,m)]`: 任务-候选节点对应去程/回程路径索引集合  
+- `L[path_idx,e]`: 路径-链路关联矩阵  
+- `scenarios[s][e]`: 场景-链路可用位图（1/0）  
+- `scenario_probs[s]`: 场景概率  
+- `X_path[s,path_idx]`: 场景-路径可用矩阵（预处理得到）
+
+### 2.2 内层求解器输入输出
+
+- 输入：`fixed_assignment: {task_id -> m}` + `Phase1Input` + `beta`  
+- 输出：`LowerResult`
+  - `status`, `obj`, `alpha`
+  - `x_in[(i,p)]`, `x_out[(i,q)]`
+  - `loss_task[(i,s)]`, `loss_sys[s]`
+  - `u_link_max`, `link_load[e]`
+  - `task_delivered_in[(i,s)]`, `task_delivered_out[(i,s)]`
+
+### 2.3 外层搜索输出
+
+- `BestResult`
+  - `best_assignment`
+  - `best_score = lambda*u_link_max + (1-lambda)*u_node_max`
+  - `u_node_max`, `u_link_max`
+  - `lower_result_ref`（最佳解内层完整结果）
+  - `all_candidates_summary`（每个候选放置方案的可行性与指标）
+
+## 3. 基本流程（第一阶段主流程）
+
+1. 读取命令行参数，设置随机种子与输出目录。  
+2. 读取拓扑（`topology.txt`、`nodes.txt`）并构建边索引映射。  
+3. 读取/生成任务集与计算节点数据。  
+4. 读取或生成路径集，建立 `L[path,e]`。  
+5. 生成故障场景与概率，计算 `X_path[s,path]`。  
+6. 外层搜索任务放置：
+   - 生成候选放置 `y`
+   - 计算节点资源利用率 `u_node_max`
+   - 若算力约束不可行，剪枝
+   - 调内层 LP 得到 `u_link_max` 与风险结果
+   - 计算综合分数并更新最优解
+7. 输出最优方案与完整中间结果（json/csv）。  
+8. 运行正确性检查（见第 8 节）。
+
+## 4. 文件组织与入口（放在 project 下，不与 code_py 混放）
+
+新工作文件统一放在 `E:\SIG\project` 下。
+
+建议新增/使用如下位置（采用“一个算法文件内部实现两层”）：
+
+- `E:\SIG\project\main_phase1.py`  
+  - 第一阶段入口，负责 argparse + 调度实验。
+- `E:\SIG\project\phase1_correctness.py`  
+  - 对标 `availability.py`，负责编排“读数据-预处理-调用求解器-汇总输出”。
+- `E:\SIG\project\Algorithms\phase1_solver.py`  
+  - 第一阶段统一求解器（核心）：在同一文件内实现外层放置搜索 + 内层固定放置 LP。  
+  - 建议主接口：`solve_phase1(topology_data, task_data, scenarios, scenario_probs, config)`。  
+  - 建议返回：`best_assignment`, `best_score`, `u_node_max`, `u_link_max`, `routing_alloc`, `scenario_losses` 等。
+- `E:\SIG\project\parsers.py`（扩展）  
+  - 新增任务数据、计算节点数据、场景配置读取函数。具体参考TEAVAR的 `parsers.py` 设计风格。
+- `E:\SIG\project\util.py`（扩展）  
+  - 新增结果落盘、校验、随机种子、矩阵构建工具。具体参考TEAVAR的 `parsers.py` 设计风格。
+- `E:\SIG\project\simulation.py`（扩展）  
+  - 新增 phase1 结果复核函数（场景损失复算、链路负载复算）。具体参考TEAVAR的 `parsers.py` 设计风格。
+
+说明：`code_py` 作为参考实现保留；新工作不与其混写。算法实现集中在 `E:\SIG\project\Algorithms\phase1_solver.py`，但在文件内部仍保持“外层函数 + 内层函数”的清晰边界。
+
+## 5. data/B4 第一阶段数据约定（按 TEAVAR 思路）
+
+第一阶段基于 `nodes/topology/demand/paths`，并新增一个轻量任务资源文件 `task.txt`。
+
+### 5.1 节点与算力约定
+
+1. 节点信息来自 `data/B4/nodes.txt`，建议新增列：`is_compute`、`cpu`。  
+2. 计算节点集合通过读取得到：`M = {v | is_compute(v)=1}`。  
+3. 第一阶段可先把 `is_compute` 全部置为 `1`（等价于“暂时所有节点可计算”），但实现上仍按列读取。  
+4. 计算资源先用**单维 CPU**：`d=1`，容量来自 `cpu` 列。  
+5. 实验建议值：第一阶段可先统一设 `cpu=100`（所有可计算节点一致），后续再切换异构容量。
+
+### 5.2 任务信息约定（由 demand 生成）
+
+参考 TEAVAR：任务先由 `demand.txt` 解析得到的 `(s_i, d_i, b_i)` 生成。
+
+1. `b_in = b_i`（即 demand 对应流量）。  
+2. 引入缩放系数 `ρ`，定义 `b_out = ρ * b_in`（可行，且适合第一阶段）。  
+3. 候选执行节点先取全体计算节点：`M_i = M`。  
+4. 新增 `data/B4/task.txt`，至少包含两列：`task_id cpu`。  
+5. 任务 CPU 需求由 `task.txt` 按任务编号索引读取（即 demand 生成任务后，按同一 `task_id` 对应取值）。
+
+### 5.3 场景生成约定
+
+场景生成直接参考 TEAVAR：
+
+1. 链路故障概率可由 Weibull 采样得到（或直接使用拓扑中的基础故障概率）。  
+2. 使用 `sub_scenarios(cutoff)` 做场景剪枝。  
+3. 场景概率按 TEAVAR 同样方式归一化。
+
+### 5.4 路径集约定
+
+路径集直接参考 TEAVAR：
+
+1. `--paths != KSP` 时，从 `data/B4/paths/*` 解析。  
+2. `--paths == KSP` 时，使用 `get_tunnels` 生成。  
+3. 预处理时按 `(s_i,m)` 与 `(m,d_i)` 取去程/回程路径子集并构建索引。
+
+说明：当前阶段不再强制 `compute_nodes.csv/tasks.json`；`nodes.txt + demand.txt + task.txt` 即可支撑实现。
+
+## 6. 命令行参数设计（第一阶段）
+
+建议 `main_phase1.py` 支持以下参数（全部可复现）：
+
+- `--topology B4`  
+- `--num-demand 1`（读取 `demand.txt` 的第几组）  
+- `--demand-scale 1.0`  
+- `--demand-downscale 2.0`  
+- `--rho 0.5`（定义 `b_out = rho * b_in`）  
+- `--paths SMORE` 或 `--path-mode KSP --k-paths 6`  
+- `--beta 0.99`  
+- `--lambda-weight 0.5`  
+- `--cutoff 1e-4`  
+- `--weibull-scale 0.001 --seed 1`  
+- `--outer-search enumerate|greedy`  
+- `--max-enumeration 50000`（防止爆炸）  
+
+说明：输出目录建议参考 TEAVAR 的 `nextRun` 机制，不单独设置 `--out-dir`；默认写入固定根目录（如 `data/raw/phase1_correctness/`），并自动创建递增编号子目录。
+任务CPU映射文件不作为命令行参数；程序根据 `topology` 自动读取 `data/<topology>/task.txt`。
+
+## 7. 参考 TEAVAR 的函数：哪些可复用，哪些需修改
+
+### 7.1 可直接复用思路
+
+- `sub_scenarios / weibull_probs`：场景采样与 cutoff 剪枝  
+- `get_tunnels / parse_paths`：路径预处理与候选路径集合  
+- `X/L` 预计算范式：把可用性判断前置到建模前
+
+### 7.2 需要补充或修改
+
+1. `read_topology`  
+   - 增加严格字段校验（列名、节点编号连续性、容量非负）。  
+   - 明确方向语义（当前文件头 `to_node/from_node` 与读取变量名易混淆，需统一）。  
+2. `parse_paths`  
+   - 增加“按节点对返回路径字典”的模式，而不仅按 flow 顺序。  
+3. 新增 `build_compute_from_nodes`、`build_tasks_from_demand_and_taskfile`  
+   - 从 `nodes.txt` 读取 `is_compute/cpu` 构造计算节点集合与单维 CPU 容量；  
+   - 从 `demand.txt` 构造任务，并根据 `rho` 生成 `b_out`，再从 `task.txt` 读取任务 CPU 需求。  
+4. 新增 `build_phase1_indices`  
+   - 统一构建 `(i,m,p)`、`(i,m,q)` 索引，避免后续模型拼接出错。  
+5. 新增 `write_phase1_results`  
+   - 按固定 schema 输出结果，便于复现实验。
+
+## 8. 第一阶段独立校验（建议保留）
+
+建议保留以下校验项：
+
+1. **退化一致性**：每任务只有一个候选执行节点时，应退化为固定源宿两阶段路由问题。  
+2. **无故障一致性**：只保留全可用场景时，场景损失应接近 0。  
+3. **单调性检查**：`beta` 增大后，风险目标不应反向明显变小（允许数值微扰）。  
+4. **容量复算检查**：用导出结果重新计算链路负载，应满足 `LinkLoad_e <= B_e * u_link_max`。  
+5. **算力复算检查**：用导出结果重新计算节点资源占用，应满足 `NodeUse_m <= C_m * u_node_max`。  
+6. **可复现性**：固定 seed 后，场景与最优解应可复现。
+
+## 9. 第一阶段输出文件详细规范
+
+建议在 `data/raw/phase1_correctness/<run_id>/` 下输出以下文件。
+
+### 9.1 `config.json`
+
+记录本次运行的完整参数（拓扑、`num_demand`、`rho`、`beta`、`lambda`、cutoff、seed、路径模式、外层搜索策略等）。
+
+### 9.2 `best_solution.json`
+
+建议包含两个部分：`global_metrics` 和 `task_rows`。
+
+1. `global_metrics`（全局最优指标）建议字段：  
+   `best_score`, `u_node_max`, `u_link_max`, `lower_obj`, `cvar`, `alpha`, `beta`, `lambda_weight`, `scenario_count`, `solver_status`, `solve_time_sec`。
+2. `task_rows`（任务级结果表）采用“列定义 + 行数据”的方式，便于你说的“第几列是什么”：  
+   - `task_rows_header` 建议固定为：  
+     `["task_idx","src_dst","selected_exec_node","cvar","alpha","lower_obj","b_in","b_out","cpu_demand"]`  
+   - `task_rows` 每行按上述顺序写值。  
+
+### 9.3 `candidate_summary.csv`
+
+含义：外层搜索过程中，**每个候选放置方案**的一行摘要，用于比较“为什么这个方案没被选中/为什么最优方案胜出”。
+
+建议列为：  
+`candidate_id,assignment_repr,is_feasible,node_feasible,lower_status,u_node_max,u_link_max,lower_obj,cvar,alpha,beta,lambda_weight,total_score,solve_time_sec,note`
+
+字段解释：  
+`assignment_repr` 可写成 `i1->m3;i2->m7;...`；  
+`total_score = lambda*u_link_max + (1-lambda)*u_node_max`；  
+`note` 用于记录不可行原因（如 `node_capacity_violation`、`lower_infeasible`）。
+
+### 9.4 `alloc_in.csv` 与 `alloc_out.csv`
+
+去程/回程路径分配明细，建议列：
+
+1. `alloc_in.csv`：`task_idx,src,exec_node,path_id,path_nodes,path_edges,alloc_bw`  
+2. `alloc_out.csv`：`task_idx,exec_node,dst,path_id,path_nodes,path_edges,alloc_bw`
+
+### 9.5 `scenario_losses.csv`
+
+场景级损失与概率，建议列：  
+`scenario_id,scenario_prob,loss_sys,cvar_aux_u,alpha,task_idx,loss_task,delivered_in,delivered_out`
+
+说明：同一 `scenario_id` 下每个 `task_idx` 一行，便于复核任务级损失构成。
+
+### 9.6 `link_loads.csv` 与 `node_utils.csv`
+
+1. `link_loads.csv`：`edge_id,u,v,capacity,load,utilization,u_link_max`  
+2. `node_utils.csv`：`node_id,is_compute,cpu_capacity,cpu_used,utilization,u_node_max`
+
+### 9.7 `sanity_checks.json`
+
+记录第8节各校验项结果，建议格式：  
+`{"check_name": {"pass": true/false, "detail": "...", "value": ...}}`
+
+以上输出规范的目标是：结果可解释、可复算、可追溯。后续第二阶段再讨论规模化加速（列生成、分解、并行等）。
+
+
+
+# 运行实验
+
+python E:\SIG\project\main_phase1.py --topology B4 --num-demand 1 --rho 0.5 --task-file data/B4/task.txt --paths SMORE --scenario-mode cutoff --cutoff 1e-4 --outer-search enumerate --max-enumeration 50000 --max-tasks 6

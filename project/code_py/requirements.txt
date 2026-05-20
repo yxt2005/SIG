@@ -1,4 +1,0 @@
-gurobipy
-numpy
-networkx
-matplotlib

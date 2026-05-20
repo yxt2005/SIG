@@ -1,0 +1,4 @@
+node_id,capacity,fail_prob,note
+mA,2.0,0.01,low node risk but risky access
+mB,1.0,0.03,medium node risk
+mC,1.0,0.02,limited capacity

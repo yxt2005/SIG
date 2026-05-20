@@ -1,0 +1,10 @@
+{
+  "beta": 0.9,
+  "beta_mode": "normal_minus_margin",
+  "beta_margin": 0.01,
+  "lambda_weight": 0.5,
+  "risk_weight": 1.0,
+  "risk_mode": "cvar_constraint",
+  "cvar_bound": 0.1,
+  "loss_aggregation": "max"
+}
