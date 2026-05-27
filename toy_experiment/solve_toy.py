@@ -1,3 +1,12 @@
+"""Toy 实验单层 MILP 求解器。
+
+输入：
+    - config 配置信息（来自toy_config.py及data/*）。
+输出：
+    - solution_bundle：包含任务放置 placement、路径流量分配 allocations，同时统计场景损失和指标。
+    - results/*.csv/json：总结实验结果。
+"""
+
 from __future__ import annotations
 
 import csv
@@ -11,6 +20,16 @@ from toy_config import Task, edge_key, enumerate_scenarios, path_edges
 
 @dataclass(frozen=True)
 class PathVar:
+    """一条候选路径变量。
+
+    关键变量：
+        task_id：任务编号。
+        phase：in 表示输入，out 表示输出端。
+        compute_node：候选计算节点。
+        path_id：优化变量 x 的唯一索引。
+        path_nodes/path_edges：路径经过的节点和无向边。
+    """
+
     task_id: str
     phase: str
     compute_node: str
@@ -20,6 +39,7 @@ class PathVar:
 
 
 def _build_path_vars(config: dict) -> list[PathVar]:
+    """从配置文件中的候选路径生成优化变量索引列表。"""
     path_vars = []
     for (task_id, compute_node, phase), items in config["paths"].items():
         for item in items:
@@ -38,6 +58,7 @@ def _build_path_vars(config: dict) -> list[PathVar]:
 
 
 def _path_available(path_var: PathVar, scenario: dict[str, Any]) -> float:
+    """判断路径在某个故障场景下是否可用；可用返回 1，不可用返回 0。"""
     if path_var.compute_node in scenario["failed_nodes"]:
         return 0.0
     if set(path_var.edges) & scenario["failed_edges"]:
@@ -46,6 +67,7 @@ def _path_available(path_var: PathVar, scenario: dict[str, Any]) -> float:
 
 
 def _weighted_cvar(losses: list[float], probs: list[float], beta: float) -> tuple[float, float]:
+    """用离散场景损失计算加权 CVaR 和对应 VaR 阈值 alpha。"""
     candidate_alphas = sorted(set([0.0, 1.0] + [float(loss) for loss in losses]))
     best_alpha = 0.0
     best_value = float("inf")
@@ -58,6 +80,7 @@ def _weighted_cvar(losses: list[float], probs: list[float], beta: float) -> tupl
 
 
 def _evaluate_solution(config: dict, placement: dict[str, str], allocations: list[dict], scenarios: list[dict[str, Any]]):
+    """在给定任务放置和路径流量分配下，逐场景评估服务损失、链路负载和风险指标。"""
     alloc_by_path = {row["path_id"]: float(row["allocation"]) for row in allocations}
     path_vars_by_id = {pv.path_id: pv for pv in _build_path_vars(config)}
 
@@ -149,6 +172,20 @@ def _evaluate_solution(config: dict, placement: dict[str, str], allocations: lis
 
 
 def solve_toy(config: dict) -> dict:
+    """建立并求解 toy MILP。
+
+    输入：
+        config：toy_config.default_config() 返回的完整实验配置。
+    输出：
+        dict：best 字段保存最优解，scenarios 字段保存用于评估的故障场景。
+
+    关键变量：
+        y[task, m]：任务是否部署到计算节点 m。
+        x[path_id]：路径预留带宽。
+        U_node_max/U_link_max：最大节点/链路资源利用率。
+        loss_task/loss_sys：任务级和系统级场景损失。
+        alpha/u_aux：CVaR 线性化辅助变量。
+    """
     try:
         import gurobipy as gp
         from gurobipy import GRB
@@ -167,12 +204,14 @@ def solve_toy(config: dict) -> dict:
     path_vars = _build_path_vars(config)
     path_by_id = {pv.path_id: pv for pv in path_vars}
 
+    #========1. 建立优化模型=======
     try:
         model = gp.Model("toy_single_level")
     except gp.GurobiError as exc:
         raise RuntimeError(f"Failed to create Gurobi model for toy experiment: {exc}") from exc
     model.Params.OutputFlag = 0
 
+    #========2. 定义决策变量=======
     y_keys = [(task.task_id, m) for task in tasks for m in task.candidates]
     y = model.addVars(y_keys, vtype=GRB.BINARY, name="y")
     x = model.addVars([pv.path_id for pv in path_vars], lb=0.0, vtype=GRB.CONTINUOUS, name="x")
@@ -189,9 +228,11 @@ def solve_toy(config: dict) -> dict:
     loss_sys = model.addVars([int(s["scenario_id"]) for s in scenarios], lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="loss_sys")
     u_aux = model.addVars([int(s["scenario_id"]) for s in scenarios], lb=0.0, vtype=GRB.CONTINUOUS, name="u")
 
+    #========3. 添加任务放置约束=======
     for task in tasks:
         model.addConstr(gp.quicksum(y[(task.task_id, m)] for m in task.candidates) == 1, name=f"place_{task.task_id}")
 
+    #========4. 添加计算节点容量约束=======
     for node_id, info in compute_nodes.items():
         model.addConstr(
             gp.quicksum(
@@ -203,6 +244,7 @@ def solve_toy(config: dict) -> dict:
             name=f"node_cap_{node_id}",
         )
 
+    #========5. 添加任务带宽需求与路径激活约束=======
     for task in tasks:
         for m in task.candidates:
             for phase, demand in (("in", task.b_in), ("out", task.b_out)):
@@ -218,6 +260,7 @@ def solve_toy(config: dict) -> dict:
                     path_capacity = min(float(config["capacities"][edge]) for edge in pv.edges)
                     model.addConstr(x[pv.path_id] <= path_capacity * y[(task.task_id, m)], name=f"active_{pv.path_id}")
 
+    #========6. 添加链路容量约束=======
     for edge, capacity in config["capacities"].items():
         model.addConstr(
             gp.quicksum(x[pv.path_id] for pv in path_vars if edge_key(*edge) in pv.edges)
@@ -225,6 +268,7 @@ def solve_toy(config: dict) -> dict:
             name=f"link_cap_{edge[0]}_{edge[1]}",
         )
 
+    #========7. 添加故障场景损失和 CVaR 线性化约束=======
     for scenario in scenarios:
         sid = int(scenario["scenario_id"])
         for task in tasks:
@@ -252,6 +296,7 @@ def solve_toy(config: dict) -> dict:
             )
         model.addConstr(u_aux[sid] >= loss_sys[sid] - alpha, name=f"u_aux_{sid}")
 
+    #========8. 设置目标函数并求解=======
     cvar_expr = alpha + gp.quicksum(float(s["probability"]) * u_aux[int(s["scenario_id"])] for s in scenarios) / (1.0 - beta)
     resource_expr = lambda_weight * u_link_max + (1.0 - lambda_weight) * u_node_max
     if risk_mode == "cvar_constraint":
@@ -266,6 +311,7 @@ def solve_toy(config: dict) -> dict:
     if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL}:
         raise RuntimeError(f"Toy MILP found no feasible solution: gurobi_status_{model.Status}")
 
+    #========9. 提取最优任务放置和路径预留带宽=======
     placement = {}
     for task in tasks:
         placement[task.task_id] = max(task.candidates, key=lambda m: y[(task.task_id, m)].X)
@@ -287,6 +333,7 @@ def solve_toy(config: dict) -> dict:
             }
         )
 
+    #========10. 评估并打包输出=======
     evaluated = _evaluate_solution(config, placement, allocations, scenarios)
     metrics = evaluated["metrics"]
     metrics.update(
@@ -319,6 +366,7 @@ def solve_toy(config: dict) -> dict:
 
 
 def write_results(solution_bundle: dict, output_dir: str | Path):
+    """将求解结果写入 CSV/JSON，供画图、论文表格和复现实验使用。"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best = solution_bundle["best"]
@@ -363,6 +411,7 @@ def write_results(solution_bundle: dict, output_dir: str | Path):
 
 
 def printable_summary(solution_bundle: dict) -> str:
+    """终端输出摘要，展示任务放置、风险指标和每条路径预留带宽。"""
     best = solution_bundle["best"]
     metrics = best["metrics"]
     lines = [

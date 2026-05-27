@@ -1,3 +1,14 @@
+"""Toy 实验主入口。
+
+输入：
+    - toy_experiment/data 下的配置信息。
+输出：
+    - toy_experiment/results/runs/xxx 下的求解结果 CSV/JSON 与拓扑图。
+
+执行方式：
+    python toy_experiment/run_toy.py
+"""
+
 from __future__ import annotations
 
 import csv
@@ -9,44 +20,8 @@ from solve_toy import printable_summary, solve_toy, write_results
 from toy_config import default_config
 
 
-def _check_visual_requirements(solution_bundle: dict) -> list[str]:
-    best = solution_bundle["best"]
-    warnings = []
-
-    if len(set(best["placement"].values())) < 2:
-        warnings.append("only one compute node is used by all tasks")
-
-    multipath_phases = set()
-    for task in best["placement"]:
-        for phase in ("in", "out"):
-            positive = [
-                row for row in best["allocations"]
-                if row["task"] == task and row["phase"] == phase and float(row["allocation"]) > 1e-7
-            ]
-            if len(positive) >= 2:
-                multipath_phases.add((task, phase))
-    if not multipath_phases:
-        warnings.append("no task phase uses multiple paths")
-
-    access_ids = {"upper_input_access", "lower_input_access", "upper_output_access", "lower_output_access"}
-    access_rows = [
-        row for row in best["scenario_rows"]
-        if any(event_id in row["event_ids"] for event_id in access_ids) and float(row["system_loss"]) > 1e-7
-    ]
-    if not access_rows:
-        warnings.append("access-link failure does not create visible service loss")
-
-    compute_rows = [
-        row for row in best["scenario_rows"]
-        if row["compute_node"] in row["failed_nodes"].split(";") and float(row["loss_task"]) > 1e-7
-    ]
-    if not compute_rows:
-        warnings.append("selected compute-node failure does not create visible task loss")
-
-    return warnings
-
-
 def _next_run_dir(results_root: Path) -> Path:
+    """生成下一个 runs/xxx 输出目录，避免覆盖历史实验结果。"""
     runs_root = results_root / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
     existing_ids = []
@@ -58,6 +33,7 @@ def _next_run_dir(results_root: Path) -> Path:
 
 
 def _write_run_metadata(config: dict, solution_bundle: dict, run_dir: Path):
+    """写入本次运行的关键配置、选址结果和指标，便于之后复现实验。"""
     best = solution_bundle["best"]
     metadata = {
         "run_id": run_dir.name,
@@ -78,6 +54,7 @@ def _write_run_metadata(config: dict, solution_bundle: dict, run_dir: Path):
 
 
 def _append_summary(results_root: Path, run_dir: Path, solution_bundle: dict):
+    """把本次运行的核心指标追加到 results/summary.csv。"""
     best = solution_bundle["best"]
     metrics = best["metrics"]
     row = {
@@ -108,6 +85,7 @@ def _append_summary(results_root: Path, run_dir: Path, solution_bundle: dict):
 
 
 def _write_latest_pointer(results_root: Path, run_dir: Path):
+    """记录最近一次运行目录，方便脚本或人工快速找到最新结果。"""
     with (results_root / "latest_run.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -121,9 +99,11 @@ def _write_latest_pointer(results_root: Path, run_dir: Path):
 
 
 def main():
+    #========1. 读取网络拓扑=======
     config = default_config()
     results_root = Path(config["results_dir"])
 
+    #========2. 打印实验配置摘要=======
     print("[toy] starting motivating example experiment")
     scenario_count = len(config["failure_scenarios"]) if config.get("failure_scenarios") else 2 ** len(config["failure_events"])
     scenario_source = "explicit_scenarios" if config.get("failure_scenarios") else "event_enumeration"
@@ -132,24 +112,22 @@ def main():
         f"scenario_source={scenario_source}, scenarios={scenario_count}, "
         f"risk_mode={config['risk_mode']}, cvar_bound={config['cvar_bound']}"
     )
+
+    #========3. 求解单层 MILP=======
     solution_bundle = solve_toy(config)
     print(printable_summary(solution_bundle))
 
+    #========4. 写出求解结果=======
     output_dir = _next_run_dir(results_root)
     output_dir = write_results(solution_bundle, output_dir)
+
+    #========5. 绘制拓扑可视化=======
     png_path, svg_path = plot_toy_solution(config, solution_bundle, output_dir)
+
+    #========6. 写出运行元数据与索引=======
     _write_run_metadata(config, solution_bundle, output_dir)
     _append_summary(results_root, output_dir, solution_bundle)
     _write_latest_pointer(results_root, output_dir)
-
-    warnings = _check_visual_requirements(solution_bundle)
-    if warnings:
-        print("[toy] visual-check warnings:")
-        for warning in warnings:
-            print(f"[toy]   - {warning}")
-        print("[toy] The outputs are valid model results, but the toy parameters may need tuning for a clearer figure.")
-    else:
-        print("[toy] visual-check passed")
 
     print(f"[toy] results_dir={output_dir.resolve()}")
     print(f"[toy] summary_csv={(results_root / 'summary.csv').resolve()}")

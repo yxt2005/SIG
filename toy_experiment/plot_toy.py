@@ -1,3 +1,12 @@
+"""Toy 实验拓扑可视化。
+
+输入：
+    - config：由 toy_config.default_config() 读取出的拓扑、任务、路径、故障场景配置。
+    - solution_bundle：由 solve_toy.solve_toy() 返回的选址、路径预留和场景损失。
+输出：
+    - toy_topology_solution.png/svg：四宫格拓扑图，展示候选拓扑、正常态和故障态。
+"""
+
 from __future__ import annotations
 
 import csv
@@ -14,6 +23,7 @@ TASK_COLORS = {"i1": "#d62728", "i2": "#1f77b4"}
 
 
 def _scenario_table(best: dict) -> dict[int, dict[str, Any]]:
+    """将逐任务的场景损失行合并成逐场景字典，便于绘图时查询故障节点/链路。"""
     grouped: dict[int, dict[str, Any]] = {}
     for row in best["scenario_rows"]:
         sid = int(row["scenario_id"])
@@ -37,6 +47,7 @@ def _scenario_table(best: dict) -> dict[int, dict[str, Any]]:
 
 
 def _choose_access_failure(best: dict):
+    """选择一个会造成损失的接入链路故障场景，用作子图 (c) 的可视化示例。"""
     scenarios = _scenario_table(best)
     access_ids = {
         "upper_input_access",
@@ -57,6 +68,7 @@ def _choose_access_failure(best: dict):
 
 
 def _choose_compute_failure(best: dict):
+    """选择一个命中已选计算节点的故障场景，用作子图 (d) 的可视化示例。"""
     scenarios = _scenario_table(best)
     selected_nodes = set(best["placement"].values())
     candidates = []
@@ -67,6 +79,7 @@ def _choose_compute_failure(best: dict):
 
 
 def _panel_caption(ax, caption: str):
+    """在每个子图下方绘制说明文字。"""
     ax.text(
         0.5,
         -0.08,
@@ -79,6 +92,7 @@ def _panel_caption(ax, caption: str):
 
 
 def _draw_base(ax, config: dict, selected_nodes: set[str] | None = None, failed_nodes=None, failed_edges=None):
+    """绘制底图：物理链路、转发节点、计算节点以及故障标记。"""
     selected_nodes = selected_nodes or set()
     failed_nodes = failed_nodes or set()
     failed_edges = failed_edges or set()
@@ -113,38 +127,103 @@ def _draw_base(ax, config: dict, selected_nodes: set[str] | None = None, failed_
                 zorder=4,
             )
             ax.add_patch(rect)
-            ax.text(x, y, node, ha="center", va="center", fontsize=12, fontstyle="italic", zorder=5)
+            ax.text(x, y, node, ha="center", va="center", fontsize=12, fontstyle="italic", zorder=11)
         else:
             circle_face = "#ffffff"
             ax.scatter([x], [y], s=390, facecolor=circle_face, edgecolor="#111111", linewidth=1.0, zorder=4)
-            ax.text(x, y, node, ha="center", va="center", fontsize=10, zorder=5)
+            ax.text(x, y, node, ha="center", va="center", fontsize=10, zorder=11)
         if node in failed_nodes:
-            ax.text(x, y, "X", ha="center", va="center", color="#d62728", fontsize=24, fontweight="bold", zorder=8)
+            ax.text(x, y, "X", ha="center", va="center", color="#d62728", fontsize=24, fontweight="bold", zorder=15)
 
 
-def _draw_path(ax, config: dict, allocation: dict, failed_edges=None, failed_nodes=None):
+def _task_demand(config: dict) -> dict[tuple[str, str], float]:
+    """返回 (任务, 阶段) 到带宽需求的映射，阶段 phase 取 in/out。"""
+    demand = {}
+    for task in config["tasks"]:
+        demand[(task.task_id, "in")] = float(task.b_in)
+        demand[(task.task_id, "out")] = float(task.b_out)
+    return demand
+
+
+def _path_failed(allocation: dict, failed_edges: set[tuple[str, str]], failed_nodes: set[str]) -> bool:
+    """判断一条候选路径在当前故障场景下是否不可用。"""
+    if allocation["compute_node"] in failed_nodes or bool(set(allocation["path_nodes"]) & failed_nodes):
+        return True
+    for u, v in zip(allocation["path_nodes"][:-1], allocation["path_nodes"][1:]):
+        if edge_key(u, v) in failed_edges:
+            return True
+    return False
+
+
+def _actual_bandwidth_by_path(
+    config: dict,
+    allocations: list[dict],
+    failed_edges: set[tuple[str, str]],
+    failed_nodes: set[str],
+) -> dict[str, float]:
+    """计算每条路径的实际占用带宽。
+
+    关键变量：
+        allocation：模型为路径预留的带宽。
+        actual：当前场景下任务流真正使用的带宽。
+
+    计算规则：
+        同一任务同一阶段的可用预留总量如果大于需求，则按预留比例分摊需求；
+        如果小于需求，则幸存路径全部用满，故障路径实际占用为 0。
+    """
+    demand = _task_demand(config)
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    actual_by_path = {row["path_id"]: 0.0 for row in allocations}
+
+    for row in allocations:
+        if float(row["allocation"]) <= 1e-7:
+            continue
+        grouped.setdefault((row["task"], row["phase"]), []).append(row)
+
+    for key, rows in grouped.items():
+        usable_rows = [row for row in rows if not _path_failed(row, failed_edges, failed_nodes)]
+        usable_reserved = sum(float(row["allocation"]) for row in usable_rows)
+        if usable_reserved <= 1e-9:
+            continue
+
+        required = demand[key]
+        scale = min(1.0, required / usable_reserved)
+        for row in usable_rows:
+            actual_by_path[row["path_id"]] = float(row["allocation"]) * scale
+    return actual_by_path
+
+
+def _format_bandwidth(value: float) -> str:
+    """格式化带宽数值：整数不显示小数，非整数保留两位小数。"""
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.2f}"
+
+
+def _draw_path(ax, config: dict, allocation: dict, actual_bandwidth: float, failed_edges=None, failed_nodes=None):
+    """绘制单条路径，并以“实际 / 预留”的形式标注带宽。"""
     failed_edges = failed_edges or set()
     failed_nodes = failed_nodes or set()
-    if float(allocation["allocation"]) <= 1e-7:
+    reserved_bandwidth = float(allocation["allocation"])
+    if reserved_bandwidth <= 1e-7:
         return
 
     path_nodes = allocation["path_nodes"]
     task = allocation["task"]
     color = TASK_COLORS.get(task, "#333333")
     linestyle = "--" if allocation["path_id"].endswith("_2") else "-"
-    path_failed = allocation["compute_node"] in failed_nodes or bool(set(path_nodes) & failed_nodes)
-    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-        if edge_key(u, v) in failed_edges:
-            path_failed = True
+    path_failed = _path_failed(allocation, failed_edges, failed_nodes)
 
     draw_color = "#9f9f9f" if path_failed else color
     alpha = 0.78 if path_failed else 1.0
     line_width = 2.8 if path_failed else 2.0
-    path_zorder = 6 if path_failed else 3
+    path_zorder = 7 if path_failed else 8
     pos = config["positions"]
     for u, v in zip(path_nodes[:-1], path_nodes[1:]):
         x1, y1 = pos[u]
         x2, y2 = pos[v]
+        shrink_a = 23 if u in config["compute_nodes"] else 16
+        shrink_b = 23 if v in config["compute_nodes"] else 16
         ax.annotate(
             "",
             xy=(x2, y2),
@@ -154,8 +233,8 @@ def _draw_path(ax, config: dict, allocation: dict, failed_edges=None, failed_nod
                 color=draw_color,
                 lw=line_width,
                 linestyle=linestyle,
-                shrinkA=13,
-                shrinkB=13,
+                shrinkA=shrink_a,
+                shrinkB=shrink_b,
                 mutation_scale=10,
                 alpha=alpha,
             ),
@@ -173,33 +252,39 @@ def _draw_path(ax, config: dict, allocation: dict, failed_edges=None, failed_nod
     ax.text(
         x_mid + path_shift,
         y_mid + task_shift + phase_shift,
-        f"{allocation['allocation']:.2f}",
+        f"{_format_bandwidth(actual_bandwidth)} / {_format_bandwidth(reserved_bandwidth)}",
         color=draw_color,
         fontsize=8,
         fontweight="bold",
         ha="center",
         va="center",
         bbox=dict(facecolor="white", edgecolor="none", alpha=0.72, pad=0.4),
-        zorder=9,
+        zorder=14,
     )
 
 
 def _draw_allocations(ax, config: dict, best: dict, scenario=None):
+    """绘制当前场景下的全部已选路径，并自动计算每条路径的实际占用带宽。"""
     failed_edges = scenario["failed_edges"] if scenario else set()
     failed_nodes = scenario["failed_nodes"] if scenario else set()
+    actual_by_path = _actual_bandwidth_by_path(config, best["allocations"], failed_edges, failed_nodes)
     ordered_allocations = []
     for allocation in best["allocations"]:
-        path_failed = allocation["compute_node"] in failed_nodes or bool(set(allocation["path_nodes"]) & failed_nodes)
-        for u, v in zip(allocation["path_nodes"][:-1], allocation["path_nodes"][1:]):
-            if edge_key(u, v) in failed_edges:
-                path_failed = True
-                break
+        path_failed = _path_failed(allocation, failed_edges, failed_nodes)
         ordered_allocations.append((path_failed, allocation))
-    for _, allocation in sorted(ordered_allocations, key=lambda item: item[0]):
-        _draw_path(ax, config, allocation, failed_edges=failed_edges, failed_nodes=failed_nodes)
+    for _, allocation in sorted(ordered_allocations, key=lambda item: 0 if item[0] else 1):
+        _draw_path(
+            ax,
+            config,
+            allocation,
+            actual_by_path.get(allocation["path_id"], 0.0),
+            failed_edges=failed_edges,
+            failed_nodes=failed_nodes,
+        )
 
 
 def _scenario_caption(scenario: dict | None, fallback: str) -> str:
+    """将场景标签转换成更适合论文图的英文描述。"""
     if not scenario:
         return fallback
     label = scenario["event_labels"]
@@ -217,6 +302,7 @@ def _scenario_caption(scenario: dict | None, fallback: str) -> str:
 
 
 def _panel_c_visual_scenario(scenario: dict | None):
+    """把接入链路故障转换成图 (c) 中更直观的转发节点 a 不可用画法。"""
     if not scenario:
         return None
     visual = dict(scenario)
@@ -230,6 +316,15 @@ def _panel_c_visual_scenario(scenario: dict | None):
 
 
 def plot_toy_solution(config: dict, solution_bundle: dict, output_dir: str | Path):
+    """生成 toy 拓扑结果图。
+
+    输入：
+        config：网络、任务、路径、故障配置。
+        solution_bundle：求解器输出的 best/all_results/scenarios。
+        output_dir：图片输出目录。
+    输出：
+        (png_path, svg_path)：生成图片的路径。
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best = solution_bundle["best"]

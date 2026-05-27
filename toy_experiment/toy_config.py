@@ -1,3 +1,18 @@
+"""toy_config.py -
+负责读取 data/ 下的任务、链路、计算节点、候选路径、故障场景。
+
+输入：
+    - data/tasks.csv：任务信息。
+    - data/compute_nodes.csv：计算节点信息。
+    - data/edges.csv：链路信息。
+    - data/paths.json：路径信息。
+    - data/failure_events.json 或 failure_scenarios.json：故障事件、场景信息。
+    - data/positions.json：节点位置信息（用于画图）。
+    - params.json：算法模型参数。
+输出：
+    - default_config() 输出 config 字典，供 solve_toy.py 和 plot_toy.py 使用，用于方案求解与画图。
+"""
+
 from __future__ import annotations
 
 import csv
@@ -10,6 +25,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Task:
+    """任务信息。描述任务 ID、源节点、目的节点、输入输出带宽、计算需求和候选计算节点。"""
+
     task_id: str
     source: str
     destination: str
@@ -21,6 +38,8 @@ class Task:
 
 @dataclass(frozen=True)
 class ComputeNode:
+    """计算节点信息，包括计算容量、失效概率"""
+
     node_id: str
     capacity: float
     fail_prob: float
@@ -29,6 +48,8 @@ class ComputeNode:
 
 @dataclass(frozen=True)
 class FailureEvent:
+    """独立故障事件信息。"""
+
     event_id: str
     label: str
     probability: float
@@ -37,20 +58,24 @@ class FailureEvent:
 
 
 def edge_key(u: str, v: str) -> tuple[str, str]:
+    """把无向边端点排序后作为统一键，避免 a-c 与 c-a 被视为不同链路。"""
     return tuple(sorted((u, v)))
 
 
 def path_edges(path_nodes: list[str] | tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """把节点序列转换成无向边序列。"""
     return tuple(edge_key(path_nodes[i], path_nodes[i + 1]) for i in range(len(path_nodes) - 1))
 
 
 def _split_semicolon(value: str | None) -> tuple[str, ...]:
+    """解析 CSV 中用分号分隔的候选节点字段。"""
     if not value:
         return ()
     return tuple(part.strip() for part in value.split(";") if part.strip())
 
 
 def _load_tasks(path: Path) -> list[Task]:
+    """读取 tasks.csv，输出 Task 列表。"""
     with path.open("r", encoding="utf-8", newline="") as f:
         rows = csv.DictReader(f)
         return [
@@ -68,6 +93,7 @@ def _load_tasks(path: Path) -> list[Task]:
 
 
 def _load_compute_nodes(path: Path) -> dict[str, ComputeNode]:
+    """读取 compute_nodes.csv，输出 node_id 到 ComputeNode 的映射。"""
     with path.open("r", encoding="utf-8", newline="") as f:
         rows = csv.DictReader(f)
         return {
@@ -82,6 +108,7 @@ def _load_compute_nodes(path: Path) -> dict[str, ComputeNode]:
 
 
 def _load_edges(path: Path) -> tuple[tuple[tuple[str, str], ...], dict[tuple[str, str], float]]:
+    """读取 edges.csv，输出链路集合和链路容量字典。"""
     edges: list[tuple[str, str]] = []
     capacities: dict[tuple[str, str], float] = {}
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -94,6 +121,7 @@ def _load_edges(path: Path) -> tuple[tuple[tuple[str, str], ...], dict[tuple[str
 
 
 def _load_paths(path: Path) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    """读取 paths.json，按 (任务, 计算节点, 阶段) 分组候选路径。"""
     with path.open("r", encoding="utf-8") as f:
         raw_paths = json.load(f)
     paths: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -109,6 +137,7 @@ def _load_paths(path: Path) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
 
 
 def _load_failure_events(path: Path) -> list[FailureEvent]:
+    """读取 failure_events.json，输出可枚举组合的基础故障事件。"""
     with path.open("r", encoding="utf-8") as f:
         raw_events = json.load(f)
     events = []
@@ -127,6 +156,7 @@ def _load_failure_events(path: Path) -> list[FailureEvent]:
 
 
 def _load_failure_scenarios(path: Path) -> list[dict]:
+    """读取显式 failure_scenarios.json，并校验场景概率总和为 1。"""
     with path.open("r", encoding="utf-8") as f:
         raw_scenarios = json.load(f)
 
@@ -153,6 +183,7 @@ def _load_failure_scenarios(path: Path) -> list[dict]:
 
 
 def _normal_probability_from_scenarios(scenarios: list[dict]) -> float:
+    """从显式场景中统计无故障 normal 场景概率。"""
     normal_prob = 0.0
     for scenario in scenarios:
         if not scenario["failed_nodes"] and not scenario["failed_edges"]:
@@ -161,6 +192,7 @@ def _normal_probability_from_scenarios(scenarios: list[dict]) -> float:
 
 
 def _normal_probability_from_events(events: list[FailureEvent]) -> float:
+    """从独立故障事件概率计算无故障概率。"""
     normal_prob = 1.0
     for event in events:
         normal_prob *= 1.0 - float(event.probability)
@@ -168,6 +200,7 @@ def _normal_probability_from_events(events: list[FailureEvent]) -> float:
 
 
 def _resolve_beta(params: dict, normal_probability: float) -> float:
+    """根据 params.json 的 beta_mode 确定 CVaR 置信水平 beta。"""
     beta_mode = params.get("beta_mode", "fixed")
     if beta_mode == "fixed":
         beta = float(params.get("beta", 0.90))
@@ -182,6 +215,14 @@ def _resolve_beta(params: dict, normal_probability: float) -> float:
 
 
 def default_config(data_dir: str | Path | None = None) -> dict:
+    """读取 toy_experiment/data ，统一配置信息。
+
+    输入：
+        data_dir：数据目录路径，默认为当前文件所在目录下的 data/ 子目录。
+    输出：
+        config 字典，包含所有配置信息。
+    """
+    #========1. 读取网络拓扑=======
     base = Path(data_dir) if data_dir is not None else Path(__file__).resolve().parent / "data"
     with (base / "positions.json").open("r", encoding="utf-8") as f:
         positions = {node: tuple(value) for node, value in json.load(f).items()}
@@ -189,6 +230,8 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         params = json.load(f)
 
     edges, capacities = _load_edges(base / "edges.csv")
+
+    #========2. 读取故障事件/显式故障场景=======
     scenario_path = base / "failure_scenarios.json"
     explicit_scenarios = _load_failure_scenarios(scenario_path) if scenario_path.exists() else None
     failure_events = _load_failure_events(base / "failure_events.json")
@@ -197,6 +240,8 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         if explicit_scenarios is not None
         else _normal_probability_from_events(failure_events)
     )
+
+    #========3. 解析风险参数=======
     beta = _resolve_beta(params, normal_probability)
     risk_mode = params.get("risk_mode", "weighted")
     if risk_mode not in {"weighted", "cvar_constraint"}:
@@ -205,6 +250,7 @@ def default_config(data_dir: str | Path | None = None) -> dict:
     if risk_mode == "cvar_constraint" and cvar_bound is None:
         raise ValueError("risk_mode=cvar_constraint requires cvar_bound in params.json.")
 
+    #========4. 打包模型输入与输出目录=======
     return {
         "beta": beta,
         "beta_mode": params.get("beta_mode", "fixed"),
@@ -228,6 +274,7 @@ def default_config(data_dir: str | Path | None = None) -> dict:
 
 
 def enumerate_scenarios(failure_events: list[FailureEvent] | tuple[FailureEvent, ...]) -> list[dict]:
+    """枚举所有故障事件组合，输出每个场景的概率、故障节点和故障链路。"""
     scenarios = []
     n = len(failure_events)
     for r in range(n + 1):
