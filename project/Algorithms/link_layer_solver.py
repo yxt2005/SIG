@@ -57,6 +57,7 @@ def solve_link_layer(
     loss_aggregation: str = "average",
     optimization_mode: str = "weighted",
     cvar_tolerance: float = 0.0,
+    cvar_bound: float | None = None,
 ):
     """在给定任务放置 assignment 后，求解链路层路由和故障损失。
 
@@ -74,9 +75,15 @@ def solve_link_layer(
     if loss_aggregation not in {"max", "average"}:
         raise ValueError("loss_aggregation must be 'max' or 'average'.")
     optimization_mode = str(optimization_mode).lower()
-    if optimization_mode not in {"weighted", "cvar_then_u"}:
-        raise ValueError("optimization_mode must be 'weighted' or 'cvar_then_u'.")
+    if optimization_mode not in {"weighted", "cvar_then_u", "cvar_constraint"}:
+        raise ValueError("optimization_mode must be 'weighted', 'cvar_then_u', or 'cvar_constraint'.")
     cvar_tolerance = max(0.0, float(cvar_tolerance))
+    if optimization_mode == "cvar_constraint":
+        if cvar_bound is None:
+            raise ValueError("cvar_bound is required when link optimization_mode is 'cvar_constraint'.")
+        cvar_bound = max(0.0, float(cvar_bound))
+    else:
+        cvar_bound = None
 
     L = build_tunnel_edge_matrix(T, nedges)
     X_path = build_tunnel_scenario_matrix(T, edges, scenarios)
@@ -201,6 +208,9 @@ def solve_link_layer(
     # ===================== 6. 目标函数：支持“加权折中”和“先损失后利用率”的两阶段优化 =====================
     if optimization_mode == "cvar_then_u":
         model.setObjective(cvar_expr, GRB.MINIMIZE)
+    elif optimization_mode == "cvar_constraint":
+        model.addConstr(cvar_expr <= float(cvar_bound) + 1e-9, name="link_cvar_sla_bound")
+        model.setObjective(u_link_max, GRB.MINIMIZE)
     else:
         model.setObjective(weighted_obj, GRB.MINIMIZE)
     model.optimize()
@@ -257,6 +267,7 @@ def solve_link_layer(
     cvar_value = float(cvar_expr.getValue())
     u_link_final = max(float(u_link_max.X), u_link_recomputed)
     weighted_obj_value = float(risk_weight) * cvar_value + (1.0 - float(risk_weight)) * u_link_final
+    link_obj_value = u_link_final if optimization_mode == "cvar_constraint" else weighted_obj_value
 
     return {
         "status": "optimal" if model.Status == GRB.OPTIMAL else "suboptimal",
@@ -273,10 +284,13 @@ def solve_link_layer(
         "delivered_out": delivered_out,
         "link_loads": link_loads,
         "u_link_max": u_link_final,
-        "link_obj": weighted_obj_value,
+        "link_obj": link_obj_value,
+        "link_weighted_obj": weighted_obj_value,
         "link_solver_obj": float(model.ObjVal),
         "link_optimization_mode": optimization_mode,
         "link_cvar_tolerance": cvar_tolerance,
+        "link_cvar_bound": cvar_bound,
+        "link_cvar_bound_slack": (float(cvar_bound) - cvar_value) if cvar_bound is not None else None,
         "link_first_stage_cvar": first_stage_cvar,
         "risk_weight": float(risk_weight),
         "loss_aggregation": loss_aggregation,

@@ -68,6 +68,8 @@ def solve_layered2_node_layer(
     node_data,
     link_capacity,
     node_proxy_link_weight: float,
+    node_risk_mode: str = "weighted",
+    node_cvar_bound: float | None = None,
 ):
     """layered2 节点层：在节点故障模型上加入平均分流代理链路项。
 
@@ -92,5 +94,7 @@ def solve_layered2_node_layer(
         proxy_link_weight=node_proxy_link_weight,
         network_affinity=None,
         node_loss_model=node_data["node_loss_model"],
+        risk_mode=node_risk_mode,
+        cvar_bound=node_cvar_bound,
         candidate_budget=1,
     )

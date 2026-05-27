@@ -329,6 +329,8 @@ def solve_node_layer(
     proxy_link_weight: float = 0.0,
     network_affinity: Mapping[Tuple[int, int], float] | None = None,
     node_loss_model: str = "node_failure",
+    risk_mode: str = "weighted",
+    cvar_bound: float | None = None,
     candidate_budget: int = 1,
     node_u_tol: float = 0.0,
     node_cvar_tol: float = 1e-4,
@@ -349,6 +351,15 @@ def solve_node_layer(
     loss_aggregation = str(loss_aggregation).lower()
     if loss_aggregation not in {"max", "average"}:
         raise ValueError("loss_aggregation must be 'max' or 'average'.")
+    risk_mode = str(risk_mode).lower()
+    if risk_mode not in {"weighted", "cvar_constraint"}:
+        raise ValueError("risk_mode must be 'weighted' or 'cvar_constraint'.")
+    if risk_mode == "cvar_constraint":
+        if cvar_bound is None:
+            raise ValueError("cvar_bound is required when node risk_mode is 'cvar_constraint'.")
+        cvar_bound = max(0.0, float(cvar_bound))
+    else:
+        cvar_bound = None
 
     compute_nodes = [int(m) for m in compute_nodes]
     eta_node = build_node_scenario_matrix(compute_nodes, node_scenarios)
@@ -432,9 +443,14 @@ def solve_node_layer(
     proxy_link_weight = float(proxy_link_weight) if proxy_link_load is not None else 0.0
     if proxy_link_weight < 0:
         raise ValueError("proxy_link_weight must be non-negative.")
-    node_load_weight = 1.0 - float(risk_weight) - proxy_link_weight
-    if node_load_weight < -1e-9:
-        raise ValueError("risk_weight + proxy_link_weight must be <= 1.")
+    if risk_mode == "cvar_constraint":
+        if proxy_link_weight > 1.0 + 1e-9:
+            raise ValueError("proxy_link_weight must be <= 1 when node risk_mode is 'cvar_constraint'.")
+        node_load_weight = 1.0 - proxy_link_weight
+    else:
+        node_load_weight = 1.0 - float(risk_weight) - proxy_link_weight
+        if node_load_weight < -1e-9:
+            raise ValueError("risk_weight + proxy_link_weight must be <= 1.")
     node_load_weight = max(0.0, node_load_weight)
     proxy_link_term = proxy_link_weight * u_link_proxy if u_link_proxy is not None else 0.0
     network_affinity_expr = 0.0
@@ -454,7 +470,12 @@ def solve_node_layer(
         + proxy_link_term
     )
     # ===================== 6. 节点层目标函数：节点层 CVaR、节点最大利用率、代理链路项加权求和 =====================
-    model.setObjective(blended_obj, GRB.MINIMIZE)
+    resource_obj = node_load_weight * u_node_max + proxy_link_term
+    if risk_mode == "cvar_constraint":
+        model.addConstr(cvar_expr <= float(cvar_bound) + 1e-9, name="node_cvar_sla_bound")
+        model.setObjective(resource_obj, GRB.MINIMIZE)
+    else:
+        model.setObjective(blended_obj, GRB.MINIMIZE)
     model.optimize()
 
     if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL}:
@@ -477,7 +498,7 @@ def solve_node_layer(
         network_affinity_value = _assignment_network_affinity(tasks, assignment, network_affinity)
 
         node_obj = (
-            float(risk_weight) * cvar_value
+            (0.0 if risk_mode == "cvar_constraint" else float(risk_weight)) * cvar_value
             + float(node_load_weight) * u_node_final
             + float(proxy_link_weight) * (u_link_proxy_value or 0.0)
         )
@@ -491,7 +512,10 @@ def solve_node_layer(
             "u_node_max": float(u_node_final),
             "solve_time_sec": time.time() - t0,
             "loss_aggregation": loss_aggregation,
+            "risk_mode": risk_mode,
             "risk_weight": float(risk_weight),
+            "cvar_bound": cvar_bound,
+            "cvar_bound_slack": (float(cvar_bound) - cvar_value) if cvar_bound is not None else None,
             "node_load_weight": float(node_load_weight),
             "proxy_link_weight": float(proxy_link_weight),
             "u_link_proxy": u_link_proxy_value,
@@ -561,11 +585,14 @@ def solve_node_layer(
     else:
         # 单候选模式直接返回节点层加权目标的最优放置，供 layered1/2 使用。
         solution = build_solution(0, "weighted_node_objective")
+        if risk_mode == "cvar_constraint" and solution.get("candidate_source") == "weighted_node_objective":
+            solution["candidate_source"] = "node_cvar_constraint_resource"
         remember_solution(solution)
         gurobi_solution_count = 1
 
     if not candidate_solutions:
-        candidate_solutions.append(build_solution(0, "weighted_node_objective"))
+        fallback_source = "node_cvar_constraint_resource" if risk_mode == "cvar_constraint" else "weighted_node_objective"
+        candidate_solutions.append(build_solution(0, fallback_source))
 
     total_node_solve_time = time.time() - t0
     for solution in candidate_solutions:

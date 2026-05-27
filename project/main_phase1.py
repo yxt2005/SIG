@@ -7,8 +7,7 @@ from phase1_correctness import run_phase1_correctness
 
 
 def read_input(message, default, typ):
-    # ===================== 1. 交互输入工具：空输入沿用默认值，非空输入按指定类型转换 =====================
-    # 当前整理阶段保留默认输入逻辑，便于重复运行实验时只修改少数参数。
+    # ===================== 交互输入工具：空输入沿用默认值，非空输入按指定类型转换 =====================
     raw = input(message)
     if len(raw.strip()) == 0:
         return default
@@ -28,7 +27,7 @@ def read_input(message, default, typ):
 
 
 def parse_commandline():
-    # ===================== 2. 命令行参数：允许直接指定实验类型，也允许进入交互式输入 =====================
+    # ===================== 命令行参数：允许直接指定实验类型，也允许进入交互式输入 =====================
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "experiment",
@@ -42,7 +41,7 @@ def main():
     parsed = parse_commandline()
     print("Asking for inputs. Press enter for default values\n")
 
-    # ===================== 3. 选择实验入口：主入口默认运行 phase1_correctness，可转到故障消融实验 =====================
+    # ===================== 1. 选择实验：主入口默认运行 phase1_correctness，可转到故障消融实验 =====================
     experiment = (
         parsed.experiment
         if parsed.experiment is not None
@@ -60,7 +59,7 @@ def main():
 
     print(f"\nRunning experiment [{experiment}]...")
 
-    # ===================== 4. 通用实验参数：读取拓扑、需求规模、任务数量和候选路径设置 =====================
+    # ===================== 2. 设置通用实验参数：拓扑、需求规模、任务数量和候选路径设置 =====================
     # 这些参数会共同决定任务集合、候选计算节点和链路层可用路径，是所有算法共用的输入。
     topology = read_input("Topology (B4): ", "B4", str)
     num_demand = read_input("Num demand row (1): ", 1, int)
@@ -80,16 +79,17 @@ def main():
     rho = read_input("Rho for b_out=rho*b_in (0.5): ", 0.5, float)
     paths = read_input("Paths mode (KSP): ", "KSP", str)
     k_paths = read_input("K paths for KSP mode (6): ", 6, int)
+    # 候选路径是否要求边不相交。默认允许共享链路。
     edge_disjoint = read_input("Edge disjoint for KSP? (false): ", False, bool)
-
     beta = read_input("Beta (0.99): ", 0.99, float)
     lambda_weight = read_input("Lambda weight (0.5): ", 0.5, float)
 
-    # ===================== 5. 风险场景参数：控制链路故障概率、场景截断阈值和随机种子 =====================
+    # 故障概率模型参数：Weibull 分布的 scale 参数和场景采样的概率截断阈值。Weibull 分布的 shape 参数固定为 0.8。
     cutoff = read_input("Scenario cutoff (1e-4): ", 1e-4, float)
     weibull_scale = read_input("Weibull scale (0.001): ", 0.001, float)
     seed = read_input("Random seed (1): ", 1, int)
 
+    # ===================== 3. 选择算法：单层算法 A 或分层算法 layered1/layered2/layered3 =====================
     algorithm = read_input("Algorithm A/layered1/layered2/layered3 (layered3): ", "layered3", str)
     if algorithm not in {"A", "layered", "layered1", "layered2", "layered3"}:
         raise ValueError(f"Unsupported algorithm: {algorithm}. Use A, layered1, layered2, or layered3.")
@@ -126,6 +126,9 @@ def main():
         link_loss_aggregation = None
         link_optimization_mode = None
         link_cvar_tolerance = None
+        link_cvar_bound = None
+        layered2_node_risk_mode = None
+        layered2_node_cvar_bound = None
         node_proxy_link_weight = None
         layered3_candidate_budget = None
         layered3_node_u_tol = None
@@ -145,26 +148,48 @@ def main():
             link_optimization_mode = "weighted"
         else:
             link_optimization_mode = read_input(
-                "Layered link optimization weighted/cvar_then_u (weighted): ",
+                "Layered link optimization weighted/cvar_then_u/cvar_constraint (weighted): ",
                 "weighted",
                 str,
             )
-        if link_optimization_mode not in {"weighted", "cvar_then_u"}:
-            raise ValueError("Link optimization mode must be weighted or cvar_then_u.")
+        if link_optimization_mode not in {"weighted", "cvar_then_u", "cvar_constraint"}:
+            raise ValueError("Link optimization mode must be weighted, cvar_then_u, or cvar_constraint.")
         link_cvar_tolerance = 0.0
+        link_cvar_bound = None
         if link_optimization_mode == "cvar_then_u":
             link_cvar_tolerance = read_input(
                 "Link CVaR tolerance inside link solver (0.0): ",
                 0.0,
                 float,
             )
+        if link_optimization_mode == "cvar_constraint":
+            link_cvar_bound = read_input("Layered link CVaR bound Gamma (0.05): ", 0.05, float)
+            if link_cvar_bound < 0:
+                raise ValueError("Layered link CVaR bound Gamma must be >= 0.")
         if algorithm == "layered2":
-            # layered2 在节点层加入平均分流代理链路项，权重不能与节点风险权重之和超过 1。
-            node_proxy_link_weight = read_input("Layered2 proxy link weight (0.1): ", 0.1, float)
-            if node_risk_weight + node_proxy_link_weight > 1.0 + 1e-9:
-                raise ValueError("For layered2, node_risk_weight + node_proxy_link_weight must be <= 1.")
-        else:
+            layered2_node_risk_mode = read_input(
+                "Layered2 node risk mode weighted/cvar_constraint (weighted): ",
+                "weighted",
+                str,
+            )
+            if layered2_node_risk_mode not in {"weighted", "cvar_constraint"}:
+                raise ValueError("Layered2 node risk mode must be weighted or cvar_constraint.")
+            if layered2_node_risk_mode == "cvar_constraint":
+                layered2_node_cvar_bound = read_input("Layered2 node proxy CVaR bound Gamma (0.05): ", 0.05, float)
+                if layered2_node_cvar_bound < 0:
+                    raise ValueError("Layered2 node proxy CVaR bound Gamma must be >= 0.")
+                node_proxy_link_weight = read_input("Layered2 node resource link weight (0.5): ", 0.5, float)
+                if node_proxy_link_weight > 1.0 + 1e-9:
+                    raise ValueError("For layered2 cvar_constraint, node resource link weight must be <= 1.")
+            else:
+                layered2_node_cvar_bound = None
+                node_proxy_link_weight = read_input("Layered2 proxy link weight (0.1): ", 0.1, float)
+                if node_risk_weight + node_proxy_link_weight > 1.0 + 1e-9:
+                    raise ValueError("For layered2, node_risk_weight + node_proxy_link_weight must be <= 1.")
+        if algorithm != "layered2":
             node_proxy_link_weight = None
+            layered2_node_risk_mode = None
+            layered2_node_cvar_bound = None
         if algorithm == "layered3":
             # layered3 固定使用网络亲和度邻域候选，链路层按 link_cvar 与 U_link 的加权和选择。
             layered3_candidate_budget = read_input("Layered3 candidate budget (8): ", 8, int)
@@ -219,6 +244,9 @@ def main():
         link_loss_aggregation=link_loss_aggregation,
         link_optimization_mode=link_optimization_mode,
         link_cvar_tolerance=link_cvar_tolerance,
+        link_cvar_bound=link_cvar_bound,
+        layered2_node_risk_mode=layered2_node_risk_mode,
+        layered2_node_cvar_bound=layered2_node_cvar_bound,
         node_proxy_link_weight=node_proxy_link_weight,
         layered3_candidate_budget=layered3_candidate_budget,
         layered3_node_u_tol=layered3_node_u_tol,

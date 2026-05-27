@@ -141,6 +141,9 @@ def run_phase1_correctness(args: Namespace):
         link_loss_aggregation = None
         link_optimization_mode = None
         link_cvar_tolerance = None
+        link_cvar_bound = None
+        layered2_node_risk_mode = None
+        layered2_node_cvar_bound = None
         node_loss_model = None
         node_proxy_split_rule = None
         node_proxy_k_paths = None
@@ -190,13 +193,34 @@ def run_phase1_correctness(args: Namespace):
         link_optimization_mode = "weighted" if is_layered3 else str(
             getattr(args, "link_optimization_mode", "weighted") or "weighted"
         ).lower()
-        if link_optimization_mode not in {"weighted", "cvar_then_u"}:
-            raise ValueError("link_optimization_mode must be 'weighted' or 'cvar_then_u'.")
+        if link_optimization_mode not in {"weighted", "cvar_then_u", "cvar_constraint"}:
+            raise ValueError("link_optimization_mode must be 'weighted', 'cvar_then_u', or 'cvar_constraint'.")
         raw_link_cvar_tolerance = getattr(args, "link_cvar_tolerance", 0.0)
         link_cvar_tolerance = 0.0 if is_layered3 else max(
             0.0,
             float(0.0 if raw_link_cvar_tolerance is None else raw_link_cvar_tolerance),
         )
+        raw_link_cvar_bound = getattr(args, "link_cvar_bound", None)
+        if (not is_layered3) and link_optimization_mode == "cvar_constraint":
+            if raw_link_cvar_bound is None:
+                raise ValueError("link_cvar_bound is required when link_optimization_mode is cvar_constraint.")
+            link_cvar_bound = max(0.0, float(raw_link_cvar_bound))
+        else:
+            link_cvar_bound = None
+        layered2_node_risk_mode = str(getattr(args, "layered2_node_risk_mode", "weighted") or "weighted").lower()
+        if not is_layered2:
+            layered2_node_risk_mode = None
+            layered2_node_cvar_bound = None
+        else:
+            if layered2_node_risk_mode not in {"weighted", "cvar_constraint"}:
+                raise ValueError("layered2_node_risk_mode must be 'weighted' or 'cvar_constraint'.")
+            raw_node_cvar_bound = getattr(args, "layered2_node_cvar_bound", None)
+            if layered2_node_risk_mode == "cvar_constraint":
+                if raw_node_cvar_bound is None:
+                    raise ValueError("layered2_node_cvar_bound is required when layered2_node_risk_mode is cvar_constraint.")
+                layered2_node_cvar_bound = max(0.0, float(raw_node_cvar_bound))
+            else:
+                layered2_node_cvar_bound = None
         node_loss_model = "average_split_proxy" if is_layered2 else "node_failure"
         node_proxy_split_rule = "average" if is_layered2 else None
         node_proxy_k_paths = int(args.k_paths) if is_layered2 else None
@@ -277,6 +301,8 @@ def run_phase1_correctness(args: Namespace):
                     node_data=layered2_node_data,
                     link_capacity=capacity,
                     node_proxy_link_weight=node_proxy_link_weight,
+                    node_risk_mode=layered2_node_risk_mode or "weighted",
+                    node_cvar_bound=layered2_node_cvar_bound,
                 )
             if is_layered3:
                 return solve_layered3_node_layer(
@@ -336,6 +362,7 @@ def run_phase1_correctness(args: Namespace):
                 loss_aggregation=link_loss_aggregation,
                 optimization_mode=link_optimization_mode,
                 cvar_tolerance=link_cvar_tolerance,
+                cvar_bound=link_cvar_bound,
             )
             if link_lower.get("status") not in {"optimal", "suboptimal"}:
                 candidate_rows.append(
@@ -377,6 +404,9 @@ def run_phase1_correctness(args: Namespace):
                 link_lower["node_proxy_link_weight"] = node_candidate["proxy_link_weight"]
                 link_lower["node_proxy_u_link_max"] = node_candidate["u_link_proxy"]
                 link_lower["node_load_weight"] = node_candidate["node_load_weight"]
+                link_lower["layered2_node_risk_mode"] = node_candidate.get("risk_mode")
+                link_lower["layered2_node_cvar_bound"] = node_candidate.get("cvar_bound")
+                link_lower["layered2_node_cvar_bound_slack"] = node_candidate.get("cvar_bound_slack")
             if is_layered3:
                 link_lower["network_affinity"] = node_candidate["network_affinity"]
                 link_lower["network_affinity_model"] = network_affinity_model
@@ -416,11 +446,16 @@ def run_phase1_correctness(args: Namespace):
                 "link_loss_aggregation": link_loss_aggregation,
                 "link_optimization_mode": link_optimization_mode,
                 "link_cvar_tolerance": link_cvar_tolerance,
+                "link_cvar_bound": link_lower.get("link_cvar_bound"),
+                "link_cvar_bound_slack": link_lower.get("link_cvar_bound_slack"),
                 "link_first_stage_cvar": link_lower.get("link_first_stage_cvar"),
                 "node_loss_model": node_loss_model,
                 "node_obj": node_candidate["node_obj"],
                 "node_cvar": node_candidate["node_cvar"],
                 "node_alpha": node_candidate["node_alpha"],
+                "layered2_node_risk_mode": node_candidate.get("risk_mode"),
+                "layered2_node_cvar_bound": node_candidate.get("cvar_bound"),
+                "layered2_node_cvar_bound_slack": node_candidate.get("cvar_bound_slack"),
                 "node_candidate_index": node_candidate.get("candidate_index"),
                 "node_candidate_source": node_candidate.get("candidate_source"),
                 "node_proxy_split_rule": node_proxy_split_rule,
@@ -528,6 +563,9 @@ def run_phase1_correctness(args: Namespace):
         "link_loss_aggregation": link_loss_aggregation,
         "link_optimization_mode": link_optimization_mode,
         "link_cvar_tolerance": link_cvar_tolerance,
+        "link_cvar_bound": link_cvar_bound,
+        "layered2_node_risk_mode": layered2_node_risk_mode,
+        "layered2_node_cvar_bound": layered2_node_cvar_bound,
         "node_loss_model": node_loss_model,
         "node_proxy_split_rule": node_proxy_split_rule,
         "node_proxy_k_paths": node_proxy_k_paths,
