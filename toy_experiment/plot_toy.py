@@ -315,6 +315,62 @@ def _panel_c_visual_scenario(scenario: dict | None):
     return visual
 
 
+def draw_working_state_panel(ax, config: dict, solution_bundle: dict, caption: str | None = None):
+    """在给定坐标轴上只绘制工作态子图，即完整四宫格图中的子图 (b)。"""
+    best = solution_bundle["best"]
+    selected_nodes = set(best["placement"].values())
+    _draw_base(ax, config, selected_nodes=selected_nodes)
+    _draw_allocations(ax, config, best)
+    if caption:
+        _panel_caption(ax, caption)
+
+
+def plot_toy_working_state(config: dict, solution_bundle: dict, output_dir: str | Path, stem: str = "toy_working_state"):
+    """单独输出当前解的工作态拓扑图，便于论文中横向比较多个模型结果。"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.8))
+    draw_working_state_panel(ax, config, solution_bundle, "(b) Working state from solved model")
+    fig.subplots_adjust(left=0.03, right=0.99, top=0.98, bottom=0.14)
+    png_path = output_dir / f"{stem}.png"
+    svg_path = output_dir / f"{stem}.svg"
+    fig.savefig(png_path, dpi=220)
+    fig.savefig(svg_path)
+    plt.close(fig)
+    return png_path, svg_path
+
+
+def plot_toy_working_state_grid(items: list[dict], output_dir: str | Path, stem: str = "toy_working_state_grid"):
+    """把同一组实验的多个工作态子图合并成一张 2x2 优先的比较图。"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not items:
+        return None, None
+
+    count = len(items)
+    if count <= 2:
+        rows, cols = 1, count
+    else:
+        rows, cols = 2, 2
+    fig, axes = plt.subplots(rows, cols, figsize=(7.2 * cols, 4.1 * rows))
+    axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
+
+    for index, (ax, item) in enumerate(zip(axes_list, items)):
+        label = chr(ord("a") + index)
+        caption = f"({label}) {item['title']}"
+        draw_working_state_panel(ax, item["config"], item["solution_bundle"], caption)
+    for ax in axes_list[count:]:
+        ax.axis("off")
+
+    fig.subplots_adjust(left=0.03, right=0.985, top=0.985, bottom=0.08, wspace=0.1, hspace=0.26)
+    png_path = output_dir / f"{stem}.png"
+    svg_path = output_dir / f"{stem}.svg"
+    fig.savefig(png_path, dpi=220)
+    fig.savefig(svg_path)
+    plt.close(fig)
+    return png_path, svg_path
+
+
 def plot_toy_solution(config: dict, solution_bundle: dict, output_dir: str | Path):
     """生成 toy 拓扑结果图。
 

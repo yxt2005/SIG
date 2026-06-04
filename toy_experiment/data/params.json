@@ -1,4 +1,7 @@
 {
+  "solver_mode": "two_layer_average_split",
+  "node_layer_risk_mode": "cvar_constraint",
+  "node_layer_cvar_bound": 0.565,
   "beta": 0.9,
   "beta_mode": "normal_minus_margin",
   "beta_margin": 0.01,

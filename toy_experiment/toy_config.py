@@ -1,16 +1,16 @@
-"""toy_config.py -
-负责读取 data/ 下的任务、链路、计算节点、候选路径、故障场景。
+"""toy_config.py - 读取 toy_experiment/data 下的实验配置。
 
 输入：
-    - data/tasks.csv：任务信息。
-    - data/compute_nodes.csv：计算节点信息。
-    - data/edges.csv：链路信息。
-    - data/paths.json：路径信息。
-    - data/failure_events.json 或 failure_scenarios.json：故障事件、场景信息。
-    - data/positions.json：节点位置信息（用于画图）。
-    - params.json：算法模型参数。
+    - tasks.csv：任务源宿、输入/输出带宽、计算需求和候选计算节点。
+    - compute_nodes.csv：计算节点容量、失效概率和备注。
+    - edges.csv：物理链路及容量。
+    - paths.json：任务到候选计算节点的输入/输出候选路径。
+    - failure_scenarios.json：人为定义的故障场景及概率；normal 场景概率自动补齐。
+    - failure_events.json：没有显式场景时用于枚举独立故障事件。
+    - positions.json：拓扑图节点坐标。
+    - params.json：求解器、风险约束和目标函数参数。
 输出：
-    - default_config() 输出 config 字典，供 solve_toy.py 和 plot_toy.py 使用，用于方案求解与画图。
+    - default_config() 返回统一 config 字典，供 solve_toy.py 和 plot_toy.py 使用。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Task:
-    """任务信息。描述任务 ID、源节点、目的节点、输入输出带宽、计算需求和候选计算节点。"""
+    """任务信息。"""
 
     task_id: str
     source: str
@@ -38,7 +38,7 @@ class Task:
 
 @dataclass(frozen=True)
 class ComputeNode:
-    """计算节点信息，包括计算容量、失效概率"""
+    """计算节点信息。"""
 
     node_id: str
     capacity: float
@@ -155,30 +155,64 @@ def _load_failure_events(path: Path) -> list[FailureEvent]:
     return events
 
 
+def _is_normal_scenario(item: dict[str, Any]) -> bool:
+    """判断一条显式场景是否是 normal 场景。"""
+    event_ids = {str(event_id).lower() for event_id in item.get("event_ids", [])}
+    label = str(item.get("label", "")).lower()
+    no_failure = not item.get("failed_nodes") and not item.get("failed_edges")
+    return no_failure and ("normal" in event_ids or label == "normal")
+
+
+def _scenario_from_item(item: dict[str, Any], scenario_id: int, probability: float) -> dict:
+    """把 JSON 场景条目转换成模型内部使用的场景字典。"""
+    failed_edges = {edge_key(edge[0], edge[1]) for edge in item.get("failed_edges", [])}
+    event_ids = list(item.get("event_ids", []))
+    label = item.get("label", "normal")
+    return {
+        "scenario_id": int(item.get("scenario_id", scenario_id)),
+        "event_ids": event_ids,
+        "event_labels": [label] if label else [],
+        "probability": float(probability),
+        "failed_nodes": set(item.get("failed_nodes", [])),
+        "failed_edges": failed_edges,
+    }
+
+
 def _load_failure_scenarios(path: Path) -> list[dict]:
-    """读取显式 failure_scenarios.json，并校验场景概率总和为 1。"""
+    """读取显式故障场景，并自动补齐 normal 场景概率。
+
+    failure_scenarios.json 允许只填写故障场景及其 probability。程序会自动计算：
+        normal_probability = 1 - sum(failure_probability)
+
+    如果文件中已经存在 normal 场景，其 probability 字段会被忽略并自动重写。
+    """
     with path.open("r", encoding="utf-8") as f:
         raw_scenarios = json.load(f)
 
-    scenarios = []
-    for idx, item in enumerate(raw_scenarios, start=1):
-        failed_edges = {edge_key(edge[0], edge[1]) for edge in item.get("failed_edges", [])}
-        event_ids = list(item.get("event_ids", []))
-        label = item.get("label", "normal")
-        scenarios.append(
-            {
-                "scenario_id": int(item.get("scenario_id", idx)),
-                "event_ids": event_ids,
-                "event_labels": [label] if label else [],
-                "probability": float(item["probability"]),
-                "failed_nodes": set(item.get("failed_nodes", [])),
-                "failed_edges": failed_edges,
-            }
-        )
+    normal_items = [item for item in raw_scenarios if _is_normal_scenario(item)]
+    failure_items = [item for item in raw_scenarios if not _is_normal_scenario(item)]
+    failure_prob = sum(float(item["probability"]) for item in failure_items)
+    if failure_prob > 1.0 + 1e-8:
+        raise ValueError(f"Toy failure scenario probabilities must not exceed 1.0, got {failure_prob:.12f}.")
+
+    normal_prob = max(0.0, 1.0 - failure_prob)
+    normal_item = normal_items[0] if normal_items else {
+        "scenario_id": 1,
+        "label": "normal",
+        "event_ids": ["normal"],
+        "failed_nodes": [],
+        "failed_edges": [],
+    }
+
+    scenarios = [_scenario_from_item(normal_item, 1, normal_prob)]
+    for idx, item in enumerate(failure_items, start=2):
+        normalized = dict(item)
+        normalized["scenario_id"] = idx
+        scenarios.append(_scenario_from_item(normalized, idx, float(item["probability"])))
 
     total_prob = sum(float(s["probability"]) for s in scenarios)
     if abs(total_prob - 1.0) > 1e-8:
-        raise ValueError(f"Toy failure scenario probabilities must sum to 1.0, got {total_prob:.12f}.")
+        raise ValueError(f"Toy failure scenario probabilities must sum to 1.0 after normal completion, got {total_prob:.12f}.")
     return scenarios
 
 
@@ -215,13 +249,7 @@ def _resolve_beta(params: dict, normal_probability: float) -> float:
 
 
 def default_config(data_dir: str | Path | None = None) -> dict:
-    """读取 toy_experiment/data ，统一配置信息。
-
-    输入：
-        data_dir：数据目录路径，默认为当前文件所在目录下的 data/ 子目录。
-    输出：
-        config 字典，包含所有配置信息。
-    """
+    """读取 toy_experiment/data，统一打包求解与绘图所需配置。"""
     #========1. 读取网络拓扑=======
     base = Path(data_dir) if data_dir is not None else Path(__file__).resolve().parent / "data"
     with (base / "positions.json").open("r", encoding="utf-8") as f:
@@ -250,8 +278,20 @@ def default_config(data_dir: str | Path | None = None) -> dict:
     if risk_mode == "cvar_constraint" and cvar_bound is None:
         raise ValueError("risk_mode=cvar_constraint requires cvar_bound in params.json.")
 
+    node_layer_risk_mode = params.get("node_layer_risk_mode", "weighted")
+    if node_layer_risk_mode not in {"weighted", "cvar_constraint"}:
+        raise ValueError("node_layer_risk_mode must be weighted or cvar_constraint.")
+    node_layer_cvar_bound = params.get("node_layer_cvar_bound")
+    if node_layer_risk_mode == "cvar_constraint" and node_layer_cvar_bound is None:
+        raise ValueError("node_layer_risk_mode=cvar_constraint requires node_layer_cvar_bound in params.json.")
+
+    solver_mode = params.get("solver_mode", "single_level")
+    if solver_mode not in {"single_level", "two_layer_average_split"}:
+        raise ValueError("solver_mode must be single_level or two_layer_average_split.")
+
     #========4. 打包模型输入与输出目录=======
     return {
+        "solver_mode": solver_mode,
         "beta": beta,
         "beta_mode": params.get("beta_mode", "fixed"),
         "beta_margin": float(params.get("beta_margin", 0.0)),
@@ -260,6 +300,8 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         "risk_weight": float(params.get("risk_weight", 1.0)),
         "risk_mode": risk_mode,
         "cvar_bound": None if cvar_bound is None else float(cvar_bound),
+        "node_layer_risk_mode": node_layer_risk_mode,
+        "node_layer_cvar_bound": None if node_layer_cvar_bound is None else float(node_layer_cvar_bound),
         "loss_aggregation": params.get("loss_aggregation", "max"),
         "tasks": _load_tasks(base / "tasks.csv"),
         "compute_nodes": _load_compute_nodes(base / "compute_nodes.csv"),
@@ -269,6 +311,7 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         "failure_events": failure_events,
         "failure_scenarios": explicit_scenarios,
         "positions": positions,
+        "params_path": str(base / "params.json"),
         "results_dir": str(Path(__file__).resolve().parent / "results"),
     }
 
