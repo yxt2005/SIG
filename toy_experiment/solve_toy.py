@@ -190,6 +190,83 @@ def _evaluate_solution(config: dict, placement: dict[str, str], allocations: lis
     }
 
 
+def _configure_solution_pool(model, config: dict):
+    """?? Gurobi solution pool?????????????? MIP ??"""
+    if not config.get("enumerate_equivalent_solutions", True):
+        return
+    model.Params.PoolSearchMode = 2
+    model.Params.PoolSolutions = int(config.get("solution_pool_limit", 50))
+    model.Params.PoolGap = float(config.get("solution_pool_gap", 0.0))
+
+
+def _pool_solution_indices(model, obj_tol: float) -> list[int]:
+    """??????????? solution pool ???"""
+    if getattr(model, "SolCount", 0) <= 0:
+        return [0]
+    best_obj = float(model.ObjVal)
+    indices = []
+    for index in range(int(model.SolCount)):
+        model.Params.SolutionNumber = index
+        pool_obj = float(model.PoolObjVal)
+        if abs(pool_obj - best_obj) <= obj_tol:
+            indices.append(index)
+    return indices or [0]
+
+
+def _value_from_solution(var, use_pool: bool) -> float:
+    """???? SolutionNumber ??????? pool ???? X?"""
+    return float(var.Xn if use_pool else var.X)
+
+
+def _placement_from_solution(tasks: list[Task], y, use_pool: bool) -> dict[str, str]:
+    """??? Gurobi ?????????"""
+    placement = {}
+    for task in tasks:
+        placement[task.task_id] = max(
+            task.candidates,
+            key=lambda m: _value_from_solution(y[(task.task_id, m)], use_pool),
+        )
+    return placement
+
+
+def _allocations_from_solution(path_vars: list[PathVar], x, use_pool: bool) -> list[dict]:
+    """??? Gurobi ?????????????"""
+    allocations = []
+    for pv in path_vars:
+        value = _value_from_solution(x[pv.path_id], use_pool)
+        if value <= 1e-8:
+            continue
+        allocations.append(
+            {
+                "task": pv.task_id,
+                "phase": pv.phase,
+                "compute_node": pv.compute_node,
+                "path_id": pv.path_id,
+                "path_nodes": list(pv.path_nodes),
+                "path_edges": [f"{u}-{v}" for u, v in pv.edges],
+                "allocation": value,
+            }
+        )
+    return allocations
+
+
+def _result_signature(placement: dict[str, str], allocations: list[dict]) -> tuple:
+    """????????? solution pool ?????????"""
+    placement_part = tuple(sorted(placement.items()))
+    allocation_part = tuple(
+        sorted(
+            (row["path_id"], round(float(row["allocation"]), 7))
+            for row in allocations
+        )
+    )
+    return placement_part, allocation_part
+
+
+def _placement_signature(placement: dict[str, str]) -> tuple:
+    """?????????"""
+    return tuple(sorted(placement.items()))
+
+
 def solve_toy_single_level(config: dict) -> dict:
     """建立并求解 toy MILP。
 
@@ -218,6 +295,8 @@ def solve_toy_single_level(config: dict) -> dict:
     lambda_weight = float(config["lambda_weight"])
     risk_weight = float(config["risk_weight"])
     risk_mode = config.get("risk_mode", "weighted")
+    routing_mode = config.get("routing_mode", "mcf")
+
     cvar_bound = config.get("cvar_bound")
     scenarios = config.get("failure_scenarios") or enumerate_scenarios(config["failure_events"])
     path_vars = _build_path_vars(config)
@@ -234,6 +313,11 @@ def solve_toy_single_level(config: dict) -> dict:
     y_keys = [(task.task_id, m) for task in tasks for m in task.candidates]
     y = model.addVars(y_keys, vtype=GRB.BINARY, name="y")
     x = model.addVars([pv.path_id for pv in path_vars], lb=0.0, vtype=GRB.CONTINUOUS, name="x")
+    path_selected = (
+        model.addVars([pv.path_id for pv in path_vars], vtype=GRB.BINARY, name="path_selected")
+        if routing_mode == "single_path"
+        else None
+    )
     u_node_max = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="U_node_max")
     u_link_max = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="U_link_max")
     alpha = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="alpha")
@@ -278,6 +362,26 @@ def solve_toy_single_level(config: dict) -> dict:
                 for pv in candidate_paths:
                     path_capacity = min(float(config["capacities"][edge]) for edge in pv.edges)
                     model.addConstr(x[pv.path_id] <= path_capacity * y[(task.task_id, m)], name=f"active_{pv.path_id}")
+
+                if routing_mode == "single_path":
+                    model.addConstr(
+                        gp.quicksum(path_selected[pv.path_id] for pv in candidate_paths) == y[(task.task_id, m)],
+                        name=f"single_path_{task.task_id}_{m}_{phase}",
+                    )
+                    for pv in candidate_paths:
+                        model.addConstr(
+                            x[pv.path_id] == float(demand) * path_selected[pv.path_id],
+                            name=f"single_path_flow_{pv.path_id}",
+                        )
+                elif routing_mode == "ecmp":
+                    equal_share = float(demand) / float(len(candidate_paths))
+                    for pv in candidate_paths:
+                        model.addConstr(
+                            x[pv.path_id] == equal_share * y[(task.task_id, m)],
+                            name=f"ecmp_flow_{pv.path_id}",
+                        )
+                elif routing_mode != "mcf":
+                    raise ValueError(f"Unsupported routing_mode: {routing_mode}.")
 
     #========6. 添加链路容量约束=======
     for edge, capacity in config["capacities"].items():
@@ -330,60 +434,69 @@ def solve_toy_single_level(config: dict) -> dict:
     if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL}:
         raise RuntimeError(f"Toy MILP found no feasible solution: gurobi_status_{model.Status}")
 
-    #========9. 提取最优任务放置和路径预留带宽=======
-    placement = {}
-    for task in tasks:
-        placement[task.task_id] = max(task.candidates, key=lambda m: y[(task.task_id, m)].X)
 
-    allocations = []
-    for pv in path_vars:
-        value = float(x[pv.path_id].X)
-        if value <= 1e-8:
+    #========9. ???????????????????=======
+    obj_tol = float(config.get("equivalent_obj_tol", 1e-6))
+    pool_indices = _pool_solution_indices(model, obj_tol)
+    all_results = []
+    seen_signatures = set()
+    for solution_id, pool_index in enumerate(pool_indices, start=1):
+        model.Params.SolutionNumber = pool_index
+        use_pool = int(model.SolCount) > 0
+        placement = _placement_from_solution(tasks, y, use_pool)
+        allocations = _allocations_from_solution(path_vars, x, use_pool)
+        signature = _result_signature(placement, allocations)
+        if signature in seen_signatures:
             continue
-        allocations.append(
+        seen_signatures.add(signature)
+
+        #========10. ???????=======
+        evaluated = _evaluate_solution(config, placement, allocations, scenarios)
+        model_cvar = _value_from_solution(alpha, use_pool) + sum(
+            float(s["probability"]) * _value_from_solution(u_aux[int(s["scenario_id"])], use_pool)
+            for s in scenarios
+        ) / (1.0 - beta)
+        metrics = evaluated["metrics"]
+        metrics.update(
             {
-                "task": pv.task_id,
-                "phase": pv.phase,
-                "compute_node": pv.compute_node,
-                "path_id": pv.path_id,
-                "path_nodes": list(pv.path_nodes),
-                "path_edges": [f"{u}-{v}" for u, v in pv.edges],
-                "allocation": value,
+                "solution_id": solution_id,
+                "pool_solution_number": pool_index,
+                "model_objective": float(model.PoolObjVal if use_pool else model.ObjVal),
+
+                "model_cvar": float(model_cvar),
+                "model_alpha": _value_from_solution(alpha, use_pool),
+                "model_u_node_max": _value_from_solution(u_node_max, use_pool),
+                "model_u_link_max": _value_from_solution(u_link_max, use_pool),
+                "risk_mode": risk_mode,
+                "cvar_bound": None if cvar_bound is None else float(cvar_bound),
+                "cvar_bound_slack": None if cvar_bound is None else float(cvar_bound) - float(model_cvar),
+                "beta_mode": config.get("beta_mode", "fixed"),
+                "beta_margin": float(config.get("beta_margin", 0.0)),
+                "normal_probability": float(config.get("normal_probability", 0.0)),
+                "solver_status": "optimal" if model.Status == GRB.OPTIMAL else "suboptimal",
+                "solver_mode": "single_level",
+                "routing_mode": routing_mode,
+
+            }
+        )
+        all_results.append(
+            {
+                "status": metrics["solver_status"],
+                "reason": "ok",
+                "placement": placement,
+                "allocations": allocations,
+                "scenario_rows": evaluated["scenario_rows"],
+                "link_loads": evaluated["link_loads"],
+                "metrics": metrics,
             }
         )
 
-    #========10. 评估并打包输出=======
-    evaluated = _evaluate_solution(config, placement, allocations, scenarios)
-    metrics = evaluated["metrics"]
-    metrics.update(
-        {
-            "model_objective": float(model.ObjVal),
-            "model_cvar": float(cvar_expr.getValue()),
-            "model_alpha": float(alpha.X),
-            "model_u_node_max": float(u_node_max.X),
-            "model_u_link_max": float(u_link_max.X),
-            "risk_mode": risk_mode,
-            "cvar_bound": None if cvar_bound is None else float(cvar_bound),
-            "cvar_bound_slack": None if cvar_bound is None else float(cvar_bound) - float(cvar_expr.getValue()),
-            "beta_mode": config.get("beta_mode", "fixed"),
-            "beta_margin": float(config.get("beta_margin", 0.0)),
-            "normal_probability": float(config.get("normal_probability", 0.0)),
-            "solver_status": "optimal" if model.Status == GRB.OPTIMAL else "suboptimal",
-        }
-    )
-
-    metrics["solver_mode"] = "single_level"
-    best = {
-        "status": metrics["solver_status"],
-        "reason": "ok",
-        "placement": placement,
-        "allocations": allocations,
-        "scenario_rows": evaluated["scenario_rows"],
-        "link_loads": evaluated["link_loads"],
-        "metrics": metrics,
-    }
-    return {"best": best, "all_results": [best], "scenarios": scenarios}
-
+    if not all_results:
+        raise RuntimeError("Toy MILP solution pool did not contain any equivalent optimal solution.")
+    for result in all_results:
+        result["metrics"]["equivalent_solution_count"] = len(all_results)
+    best = all_results[0]
+    return {"best": best, "all_results": all_results, "scenarios": scenarios}
 
 def _candidate_paths(path_vars: list[PathVar], task_id: str, compute_node: str, phase: str) -> list[PathVar]:
     """筛选某个任务、候选计算节点和阶段对应的候选路径。"""
@@ -452,6 +565,7 @@ def _solve_toy_node_layer_average_split(config: dict, path_vars: list[PathVar], 
 
     model = gp.Model("toy_two_layer_node_average_split")
     model.Params.OutputFlag = 0
+    _configure_solution_pool(model, config)
 
     y_keys = [(task.task_id, m) for task in tasks for m in task.candidates]
     y = model.addVars(y_keys, vtype=GRB.BINARY, name="y")
@@ -528,22 +642,45 @@ def _solve_toy_node_layer_average_split(config: dict, path_vars: list[PathVar], 
     if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL}:
         raise RuntimeError(f"Toy two-layer node model found no feasible solution: gurobi_status_{model.Status}")
 
-    placement = {}
-    for task in tasks:
-        placement[task.task_id] = max(task.candidates, key=lambda m: y[(task.task_id, m)].X)
+    obj_tol = float(config.get("equivalent_obj_tol", 1e-6))
+    pool_indices = _pool_solution_indices(model, obj_tol)
+    all_node_results = []
+    seen_placements = set()
+    for node_solution_id, pool_index in enumerate(pool_indices, start=1):
+        model.Params.SolutionNumber = pool_index
+        use_pool = int(model.SolCount) > 0
+        placement = _placement_from_solution(tasks, y, use_pool)
+        signature = _placement_signature(placement)
+        if signature in seen_placements:
+            continue
+        seen_placements.add(signature)
+        node_cvar = _value_from_solution(alpha, use_pool) + sum(
+            float(s["probability"]) * _value_from_solution(u_aux[int(s["scenario_id"])], use_pool)
+            for s in scenarios
+        ) / (1.0 - beta)
+        all_node_results.append(
+            {
+                "status": "optimal" if model.Status == GRB.OPTIMAL else "suboptimal",
+                "placement": placement,
+                "node_solution_id": node_solution_id,
+                "node_pool_solution_number": pool_index,
+                "node_objective": float(model.PoolObjVal if use_pool else model.ObjVal),
+                "node_cvar": float(node_cvar),
+                "node_alpha": _value_from_solution(alpha, use_pool),
+                "node_u_node_max": _value_from_solution(u_node_max, use_pool),
+                "node_u_link_proxy": _value_from_solution(u_link_proxy, use_pool),
+                "node_cvar_bound_slack": None if cvar_bound is None else float(cvar_bound) - float(node_cvar),
+                "node_risk_mode": risk_mode,
+                "node_cvar_bound": None if cvar_bound is None else float(cvar_bound),
+            }
+        )
 
-    return {
-        "status": "optimal" if model.Status == GRB.OPTIMAL else "suboptimal",
-        "placement": placement,
-        "node_objective": float(model.ObjVal),
-        "node_cvar": float(cvar_expr.getValue()),
-        "node_alpha": float(alpha.X),
-        "node_u_node_max": float(u_node_max.X),
-        "node_u_link_proxy": float(u_link_proxy.X),
-        "node_cvar_bound_slack": None if cvar_bound is None else float(cvar_bound) - float(cvar_expr.getValue()),
-        "node_risk_mode": risk_mode,
-        "node_cvar_bound": None if cvar_bound is None else float(cvar_bound),
-    }
+    if not all_node_results:
+        raise RuntimeError("Toy two-layer node solution pool did not contain any equivalent optimal placement.")
+    result = dict(all_node_results[0])
+    result["all_node_results"] = all_node_results
+    result["equivalent_node_solution_count"] = len(all_node_results)
+    return result
 
 
 def _solve_toy_link_layer_fixed_placement(
@@ -667,56 +804,74 @@ def _solve_toy_link_layer_fixed_placement(
 
 
 def solve_toy_two_layer_average_split(config: dict) -> dict:
-    """求解 toy 平均分流双层模型，并复用单层模型的输出结构。"""
+    """?? toy ??????????????????????????????"""
     scenarios = config.get("failure_scenarios") or enumerate_scenarios(config["failure_events"])
     path_vars = _build_path_vars(config)
 
     node_result = _solve_toy_node_layer_average_split(config, path_vars, scenarios)
-    link_result = _solve_toy_link_layer_fixed_placement(config, path_vars, scenarios, node_result["placement"])
-    evaluated = _evaluate_solution(config, node_result["placement"], link_result["allocations"], scenarios)
+    all_results = []
+    seen_signatures = set()
+    for node_item in node_result.get("all_node_results", [node_result]):
+        link_result = _solve_toy_link_layer_fixed_placement(config, path_vars, scenarios, node_item["placement"])
+        evaluated = _evaluate_solution(config, node_item["placement"], link_result["allocations"], scenarios)
+        signature = _result_signature(node_item["placement"], link_result["allocations"])
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
 
-    metrics = evaluated["metrics"]
-    metrics.update(
-        {
-            "solver_mode": "two_layer_average_split",
-            "model_objective": float(link_result["link_objective"]),
-            "model_cvar": float(link_result["link_cvar"]),
-            "model_alpha": float(link_result["link_alpha"]),
-            "model_u_node_max": float(node_result["node_u_node_max"]),
-            "model_u_link_max": float(link_result["link_u_link_max"]),
-            "risk_mode": config.get("risk_mode", "weighted"),
-            "cvar_bound": config.get("cvar_bound"),
-            "cvar_bound_slack": link_result["link_cvar_bound_slack"],
-            "beta_mode": config.get("beta_mode", "fixed"),
-            "beta_margin": float(config.get("beta_margin", 0.0)),
-            "normal_probability": float(config.get("normal_probability", 0.0)),
-            "node_layer_objective": float(node_result["node_objective"]),
-            "node_layer_cvar": float(node_result["node_cvar"]),
-            "node_layer_alpha": float(node_result["node_alpha"]),
-            "node_layer_u_node_max": float(node_result["node_u_node_max"]),
-            "node_layer_u_link_proxy": float(node_result["node_u_link_proxy"]),
-            "node_layer_cvar_bound_slack": node_result["node_cvar_bound_slack"],
-            "node_layer_risk_mode": node_result["node_risk_mode"],
-            "node_layer_cvar_bound": node_result["node_cvar_bound"],
-            "link_layer_objective": float(link_result["link_objective"]),
-            "link_layer_cvar": float(link_result["link_cvar"]),
-            "link_layer_alpha": float(link_result["link_alpha"]),
-            "link_layer_u_link_max": float(link_result["link_u_link_max"]),
-            "link_layer_cvar_bound_slack": link_result["link_cvar_bound_slack"],
-            "solver_status": "optimal" if node_result["status"] == "optimal" and link_result["status"] == "optimal" else "suboptimal",
-        }
-    )
+        metrics = evaluated["metrics"]
+        metrics.update(
+            {
+                "solution_id": len(all_results) + 1,
+                "node_solution_id": node_item.get("node_solution_id"),
+                "solver_mode": "two_layer_average_split",
+                "model_objective": float(link_result["link_objective"]),
+                "model_cvar": float(link_result["link_cvar"]),
+                "model_alpha": float(link_result["link_alpha"]),
+                "model_u_node_max": float(node_item["node_u_node_max"]),
+                "model_u_link_max": float(link_result["link_u_link_max"]),
+                "risk_mode": config.get("risk_mode", "weighted"),
+                "cvar_bound": config.get("cvar_bound"),
+                "cvar_bound_slack": link_result["link_cvar_bound_slack"],
+                "beta_mode": config.get("beta_mode", "fixed"),
+                "beta_margin": float(config.get("beta_margin", 0.0)),
+                "normal_probability": float(config.get("normal_probability", 0.0)),
+                "node_layer_objective": float(node_item["node_objective"]),
+                "node_layer_cvar": float(node_item["node_cvar"]),
+                "node_layer_alpha": float(node_item["node_alpha"]),
+                "node_layer_u_node_max": float(node_item["node_u_node_max"]),
+                "node_layer_u_link_proxy": float(node_item["node_u_link_proxy"]),
+                "node_layer_cvar_bound_slack": node_item["node_cvar_bound_slack"],
+                "node_layer_risk_mode": node_item["node_risk_mode"],
+                "node_layer_cvar_bound": node_item["node_cvar_bound"],
+                "equivalent_node_solution_count": node_result.get("equivalent_node_solution_count", 1),
+                "link_layer_objective": float(link_result["link_objective"]),
+                "link_layer_cvar": float(link_result["link_cvar"]),
+                "link_layer_alpha": float(link_result["link_alpha"]),
+                "link_layer_u_link_max": float(link_result["link_u_link_max"]),
+                "link_layer_cvar_bound_slack": link_result["link_cvar_bound_slack"],
+                "solver_status": "optimal" if node_item["status"] == "optimal" and link_result["status"] == "optimal" else "suboptimal",
+            }
+        )
 
-    best = {
-        "status": metrics["solver_status"],
-        "reason": "ok",
-        "placement": node_result["placement"],
-        "allocations": link_result["allocations"],
-        "scenario_rows": evaluated["scenario_rows"],
-        "link_loads": evaluated["link_loads"],
-        "metrics": metrics,
-    }
-    return {"best": best, "all_results": [best], "scenarios": scenarios}
+        all_results.append(
+            {
+                "status": metrics["solver_status"],
+                "reason": "ok",
+                "placement": node_item["placement"],
+                "allocations": link_result["allocations"],
+                "scenario_rows": evaluated["scenario_rows"],
+                "link_loads": evaluated["link_loads"],
+                "metrics": metrics,
+            }
+        )
+
+    if not all_results:
+        raise RuntimeError("Toy two-layer solver did not produce any equivalent solution.")
+    for result in all_results:
+        result["metrics"]["equivalent_solution_count"] = len(all_results)
+    best = all_results[0]
+    return {"best": best, "all_results": all_results, "scenarios": scenarios}
 
 
 def solve_toy(config: dict) -> dict:
@@ -769,6 +924,64 @@ def write_results(solution_bundle: dict, output_dir: str | Path):
         writer.writeheader()
         writer.writerow(metric_row)
 
+    all_results = solution_bundle.get("all_results", [best])
+    equivalent_rows = []
+    equivalent_allocations = []
+    equivalent_json = []
+    for index, result in enumerate(all_results, start=1):
+        metrics = result["metrics"]
+        placement_text = ";".join(f"{task}->{node}" for task, node in result["placement"].items())
+        equivalent_rows.append(
+            {
+                "solution_id": metrics.get("solution_id", index),
+                "status": result["status"],
+                "reason": result["reason"],
+                "placement": placement_text,
+                "solver_mode": metrics.get("solver_mode"),
+                "model_objective": metrics.get("model_objective"),
+                "eval_cvar": metrics.get("cvar"),
+                "model_cvar": metrics.get("model_cvar"),
+                "model_u_node_max": metrics.get("model_u_node_max"),
+                "model_u_link_max": metrics.get("model_u_link_max"),
+                "total_reserved_bandwidth": metrics.get("total_reserved_bandwidth"),
+                "effective_throughput": metrics.get("effective_throughput"),
+                "min_loss": metrics.get("min_loss"),
+                "expected_loss": metrics.get("expected_loss"),
+                "max_loss": metrics.get("max_loss"),
+                "node_layer_objective": metrics.get("node_layer_objective"),
+                "node_layer_cvar": metrics.get("node_layer_cvar"),
+                "node_layer_cvar_bound": metrics.get("node_layer_cvar_bound"),
+                "link_layer_cvar": metrics.get("link_layer_cvar"),
+            }
+        )
+        equivalent_json.append(
+            {
+                "solution_id": metrics.get("solution_id", index),
+                "status": result["status"],
+                "reason": result["reason"],
+                "placement": result["placement"],
+                "metrics": metrics,
+            }
+        )
+        for row in result["allocations"]:
+            item = dict(row)
+            item["solution_id"] = metrics.get("solution_id", index)
+            equivalent_allocations.append(item)
+
+    if equivalent_rows:
+        with (output_dir / "equivalent_solutions.csv").open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(equivalent_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(equivalent_rows)
+        with (output_dir / "equivalent_solutions.json").open("w", encoding="utf-8") as f:
+            json.dump(equivalent_json, f, ensure_ascii=False, indent=2)
+    if equivalent_allocations:
+        fieldnames = ["solution_id"] + [key for key in equivalent_allocations[0].keys() if key != "solution_id"]
+        with (output_dir / "equivalent_path_allocations.csv").open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(equivalent_allocations)
+
     return output_dir
 
 
@@ -781,6 +994,7 @@ def printable_summary(solution_bundle: dict) -> str:
         (
             "[toy] selected metrics: "
             f"solver_mode={metrics.get('solver_mode', 'single_level')}, "
+            f"routing_mode={metrics.get('routing_mode', 'mcf')}, "
             f"risk_mode={metrics['risk_mode']}, beta={metrics['beta']:.6f}, "
             f"obj={metrics['model_objective']:.6f}, model_CVaR={metrics['model_cvar']:.6f}, "
             f"eval_CVaR={metrics['cvar']:.6f}, availability={metrics['availability']:.6f}, "
