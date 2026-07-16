@@ -16,7 +16,7 @@ import json
 import shutil
 from pathlib import Path
 
-from plot_toy import plot_toy_solution
+from plot_toy import plot_toy_equivalent_working_state_grid, plot_toy_solution
 from solve_toy import printable_summary, solve_toy, write_results
 from toy_config import default_config
 
@@ -26,6 +26,7 @@ SUMMARY_FIELDS = [
     "run_dir",
     "best_placement",
     "solver_mode",
+    "routing_mode",
     "risk_mode",
     "cvar_bound",
     "beta",
@@ -47,6 +48,7 @@ SUMMARY_FIELDS = [
     "expected_loss",
     "max_loss",
     "availability",
+    "equivalent_solution_count",
     "solver_status",
 ]
 
@@ -66,6 +68,9 @@ def _next_run_dir(results_root: Path) -> Path:
 def _copy_run_params(config: dict, run_dir: Path):
     """复制本次运行使用的 params.json，便于复现实验设置。"""
     shutil.copy2(Path(config["params_path"]), run_dir / "params.json")
+    scenario_path = Path(config["failure_scenarios_path"])
+    if scenario_path.exists():
+        shutil.copy2(scenario_path, run_dir / scenario_path.name)
 
 
 def _write_run_metadata(config: dict, solution_bundle: dict, run_dir: Path):
@@ -76,15 +81,21 @@ def _write_run_metadata(config: dict, solution_bundle: dict, run_dir: Path):
         "status": best["status"],
         "reason": best["reason"],
         "solver_mode": best["metrics"].get("solver_mode", config["solver_mode"]),
+        "routing_mode": best["metrics"].get("routing_mode", config.get("routing_mode", "mcf")),
         "files": {
             "params": "params.json",
+            "failure_scenarios": Path(config["failure_scenarios_path"]).name,
             "placements": "placements.json",
             "metrics": "metrics.csv",
             "path_allocations": "path_allocations.csv",
             "scenario_losses": "scenario_losses.csv",
             "link_loads": "link_loads.csv",
+            "equivalent_solutions": "equivalent_solutions.csv",
+            "equivalent_path_allocations": "equivalent_path_allocations.csv",
             "figure_png": "toy_topology_solution.png",
             "figure_svg": "toy_topology_solution.svg",
+            "equivalent_working_state_png": "toy_equivalent_working_state_grid.png",
+            "equivalent_working_state_svg": "toy_equivalent_working_state_grid.svg",
         },
     }
     with (run_dir / "run_metadata.json").open("w", encoding="utf-8") as f:
@@ -98,6 +109,7 @@ def _summary_row_from_parts(run_dir: Path, placement: dict, metrics: dict) -> di
         "run_dir": str(run_dir.resolve()),
         "best_placement": ";".join(f"{task}->{node}" for task, node in placement.items()),
         "solver_mode": metrics.get("solver_mode"),
+        "routing_mode": metrics.get("routing_mode", "mcf"),
         "risk_mode": metrics.get("risk_mode"),
         "cvar_bound": metrics.get("cvar_bound"),
         "beta": metrics.get("beta"),
@@ -119,6 +131,7 @@ def _summary_row_from_parts(run_dir: Path, placement: dict, metrics: dict) -> di
         "expected_loss": metrics.get("expected_loss"),
         "max_loss": metrics.get("max_loss"),
         "availability": metrics.get("availability"),
+        "equivalent_solution_count": metrics.get("equivalent_solution_count"),
         "solver_status": metrics.get("solver_status"),
     }
     return {field: row.get(field, "") for field in SUMMARY_FIELDS}
@@ -252,6 +265,7 @@ def main():
         f"[toy] beta={config['beta']}, tasks={len(config['tasks'])}, "
         f"scenario_source={scenario_source}, scenarios={scenario_count}, "
         f"solver_mode={config['solver_mode']}, "
+        f"routing_mode={config['routing_mode']}, "
         f"node_layer_risk_mode={config['node_layer_risk_mode']}, "
         f"node_layer_cvar_bound={config['node_layer_cvar_bound']}, "
         f"risk_mode={config['risk_mode']}, cvar_bound={config['cvar_bound']}"
@@ -267,6 +281,7 @@ def main():
 
     #========5. 绘制拓扑可视化=======
     png_path, svg_path = plot_toy_solution(config, solution_bundle, output_dir)
+    equivalent_png_path, equivalent_svg_path = plot_toy_equivalent_working_state_grid(config, solution_bundle, output_dir)
 
     #========6. 写出运行元数据与索引=======
     _copy_run_params(config, output_dir)
@@ -279,6 +294,9 @@ def main():
     print(f"[toy] latest_run={(results_root / 'latest_run.json').resolve()}")
     print(f"[toy] figure_png={png_path.resolve()}")
     print(f"[toy] figure_svg={svg_path.resolve()}")
+    if equivalent_png_path is not None:
+        print(f"[toy] equivalent_working_state_png={equivalent_png_path.resolve()}")
+        print(f"[toy] equivalent_working_state_svg={equivalent_svg_path.resolve()}")
 
 
 if __name__ == "__main__":

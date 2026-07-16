@@ -1,0 +1,29 @@
+{
+  "description": "Scenario set 3: compute-node failures only. Normal scenario probability is completed automatically.",
+  "scenarios": [
+    {
+      "scenario_id": 1,
+      "label": "mA compute site unavailable",
+      "probability": 0.005,
+      "event_ids": ["site_mA"],
+      "failed_nodes": ["mA"],
+      "failed_edges": []
+    },
+    {
+      "scenario_id": 2,
+      "label": "mB compute site unavailable",
+      "probability": 0.007,
+      "event_ids": ["site_mB"],
+      "failed_nodes": ["mB"],
+      "failed_edges": []
+    },
+    {
+      "scenario_id": 3,
+      "label": "mC compute site unavailable",
+      "probability": 0.006,
+      "event_ids": ["site_mC"],
+      "failed_nodes": ["mC"],
+      "failed_edges": []
+    }
+  ]
+}

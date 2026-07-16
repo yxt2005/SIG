@@ -1,13 +1,18 @@
 {
-  "solver_mode": "two_layer_average_split",
+  "solver_mode": "single_level",
+  "routing_mode": "mcf",
+  "failure_scenarios_file": "failure_events_4.json",
   "node_layer_risk_mode": "cvar_constraint",
   "node_layer_cvar_bound": 0.565,
-  "beta": 0.9,
-  "beta_mode": "normal_minus_margin",
+  "beta": 0.85,
+  "beta_mode": "fixed",
   "beta_margin": 0.01,
   "lambda_weight": 0.5,
   "risk_weight": 1.0,
   "risk_mode": "cvar_constraint",
   "cvar_bound": 0.1,
-  "loss_aggregation": "max"
+  "loss_aggregation": "max",
+  "enumerate_equivalent_solutions": true,
+  "solution_pool_limit": 50,
+  "equivalent_obj_tol": 1e-06
 }

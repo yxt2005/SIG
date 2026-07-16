@@ -71,6 +71,7 @@ def _case_params(base_params: dict[str, Any], solver_mode: str, link_bound: floa
     params["risk_mode"] = "cvar_constraint"
     params["cvar_bound"] = float(link_bound)
     params["solver_mode"] = solver_mode
+    params["routing_mode"] = "mcf"
 
     if solver_mode == "single_level":
         params["node_layer_risk_mode"] = "weighted"
@@ -89,11 +90,18 @@ def _case_plot_title(params: dict[str, Any]) -> str:
     """Build a compact title for working-state comparison panels."""
     link_bound = params.get("cvar_bound")
     if params["solver_mode"] == "single_level":
-        return f"Single, Γ_L={link_bound}"
+        routing_mode = params.get("routing_mode", "mcf")
+        return f"Single ({routing_mode}), Γ_L={link_bound}"
     return f"Two-layer, Γ_N={params.get('node_layer_cvar_bound')}"
 
 
-def _run_case(case_name: str, params: dict[str, Any], batch_dir: Path, make_plot: bool) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _run_case(
+    case_name: str,
+    params: dict[str, Any],
+    batch_dir: Path,
+    make_plot: bool,
+    print_summary: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Run one toy experiment case and return one summary row."""
     with tempfile.TemporaryDirectory(prefix="toy_compare_") as tmp:
         temp_data_dir = Path(tmp) / "data"
@@ -109,6 +117,7 @@ def _run_case(case_name: str, params: dict[str, Any], batch_dir: Path, make_plot
         row: dict[str, Any] = {
             "case_name": case_name,
             "solver_mode": params["solver_mode"],
+            "routing_mode": params.get("routing_mode", "mcf"),
             "link_cvar_bound": params.get("cvar_bound"),
             "node_layer_cvar_bound": params.get("node_layer_cvar_bound"),
             "run_id": output_dir.name,
@@ -117,7 +126,8 @@ def _run_case(case_name: str, params: dict[str, Any], batch_dir: Path, make_plot
 
         try:
             solution_bundle = solve_toy(config)
-            print(printable_summary(solution_bundle))
+            if print_summary:
+                print(printable_summary(solution_bundle))
 
             write_results(solution_bundle, output_dir)
             png_path = None
@@ -141,6 +151,8 @@ def _run_case(case_name: str, params: dict[str, Any], batch_dir: Path, make_plot
                     "reason": best["reason"],
                     "placement": ";".join(f"{task}->{node}" for task, node in best["placement"].items()),
                     "model_cvar": metrics.get("model_cvar"),
+
+
                     "eval_cvar": metrics.get("cvar"),
                     "cvar_bound_slack": metrics.get("cvar_bound_slack"),
                     "model_u_node_max": metrics.get("model_u_node_max"),

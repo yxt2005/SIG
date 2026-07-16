@@ -5,8 +5,7 @@
     - compute_nodes.csv：计算节点容量、失效概率和备注。
     - edges.csv：物理链路及容量。
     - paths.json：任务到候选计算节点的输入/输出候选路径。
-    - failure_scenarios.json：人为定义的故障场景及概率；normal 场景概率自动补齐。
-    - failure_events.json：没有显式场景时用于枚举独立故障事件。
+    - failure_events_*.json：人为定义的故障场景及概率；normal 场景概率自动补齐。
     - positions.json：拓扑图节点坐标。
     - params.json：求解器、风险约束和目标函数参数。
 输出：
@@ -137,7 +136,7 @@ def _load_paths(path: Path) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
 
 
 def _load_failure_events(path: Path) -> list[FailureEvent]:
-    """读取 failure_events.json，输出可枚举组合的基础故障事件。"""
+    """读取旧版独立故障事件列表，输出可枚举组合的基础故障事件。"""
     with path.open("r", encoding="utf-8") as f:
         raw_events = json.load(f)
     events = []
@@ -181,13 +180,14 @@ def _scenario_from_item(item: dict[str, Any], scenario_id: int, probability: flo
 def _load_failure_scenarios(path: Path) -> list[dict]:
     """读取显式故障场景，并自动补齐 normal 场景概率。
 
-    failure_scenarios.json 允许只填写故障场景及其 probability。程序会自动计算：
+    failure_events_*.json 允许只填写故障场景及其 probability。程序会自动计算：
         normal_probability = 1 - sum(failure_probability)
 
     如果文件中已经存在 normal 场景，其 probability 字段会被忽略并自动重写。
     """
     with path.open("r", encoding="utf-8") as f:
-        raw_scenarios = json.load(f)
+        raw_data = json.load(f)
+    raw_scenarios = raw_data.get("scenarios", []) if isinstance(raw_data, dict) else raw_data
 
     normal_items = [item for item in raw_scenarios if _is_normal_scenario(item)]
     failure_items = [item for item in raw_scenarios if not _is_normal_scenario(item)]
@@ -260,9 +260,10 @@ def default_config(data_dir: str | Path | None = None) -> dict:
     edges, capacities = _load_edges(base / "edges.csv")
 
     #========2. 读取故障事件/显式故障场景=======
-    scenario_path = base / "failure_scenarios.json"
+    scenario_file = params.get("failure_scenarios_file", "failure_events_4.json")
+    scenario_path = base / scenario_file
     explicit_scenarios = _load_failure_scenarios(scenario_path) if scenario_path.exists() else None
-    failure_events = _load_failure_events(base / "failure_events.json")
+    failure_events = []
     normal_probability = (
         _normal_probability_from_scenarios(explicit_scenarios)
         if explicit_scenarios is not None
@@ -289,9 +290,16 @@ def default_config(data_dir: str | Path | None = None) -> dict:
     if solver_mode not in {"single_level", "two_layer_average_split"}:
         raise ValueError("solver_mode must be single_level or two_layer_average_split.")
 
+    routing_mode = params.get("routing_mode", "mcf")
+    if routing_mode not in {"mcf", "single_path", "ecmp"}:
+        raise ValueError("routing_mode must be mcf, single_path, or ecmp.")
+    if solver_mode != "single_level" and routing_mode != "mcf":
+        raise ValueError("single_path and ecmp routing modes are only supported by solver_mode=single_level.")
+
     #========4. 打包模型输入与输出目录=======
     return {
         "solver_mode": solver_mode,
+        "routing_mode": routing_mode,
         "beta": beta,
         "beta_mode": params.get("beta_mode", "fixed"),
         "beta_margin": float(params.get("beta_margin", 0.0)),
@@ -300,9 +308,15 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         "risk_weight": float(params.get("risk_weight", 1.0)),
         "risk_mode": risk_mode,
         "cvar_bound": None if cvar_bound is None else float(cvar_bound),
+
+
         "node_layer_risk_mode": node_layer_risk_mode,
         "node_layer_cvar_bound": None if node_layer_cvar_bound is None else float(node_layer_cvar_bound),
         "loss_aggregation": params.get("loss_aggregation", "max"),
+        "enumerate_equivalent_solutions": bool(params.get("enumerate_equivalent_solutions", True)),
+        "solution_pool_limit": int(params.get("solution_pool_limit", 50)),
+        "solution_pool_gap": float(params.get("solution_pool_gap", 0.0)),
+        "equivalent_obj_tol": float(params.get("equivalent_obj_tol", 1e-6)),
         "tasks": _load_tasks(base / "tasks.csv"),
         "compute_nodes": _load_compute_nodes(base / "compute_nodes.csv"),
         "edges": edges,
@@ -310,6 +324,8 @@ def default_config(data_dir: str | Path | None = None) -> dict:
         "paths": _load_paths(base / "paths.json"),
         "failure_events": failure_events,
         "failure_scenarios": explicit_scenarios,
+        "failure_scenarios_file": scenario_file,
+        "failure_scenarios_path": str(scenario_path),
         "positions": positions,
         "params_path": str(base / "params.json"),
         "results_dir": str(Path(__file__).resolve().parent / "results"),

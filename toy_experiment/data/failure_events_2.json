@@ -1,0 +1,53 @@
+{
+  "description": "Scenario set 2: link failures only. Normal scenario probability is completed automatically.",
+  "scenarios": [
+    {
+      "scenario_id": 1,
+      "label": "shared input link a-c failure",
+      "probability": 0.015,
+      "event_ids": ["link_ac"],
+      "failed_nodes": [],
+      "failed_edges": [["a", "c"]]
+    },
+    {
+      "scenario_id": 2,
+      "label": "shared output link b-d failure",
+      "probability": 0.015,
+      "event_ids": ["link_bd"],
+      "failed_nodes": [],
+      "failed_edges": [["b", "d"]]
+    },
+    {
+      "scenario_id": 3,
+      "label": "upper input access links fail",
+      "probability": 0.028,
+      "event_ids": ["upper_input_access"],
+      "failed_nodes": [],
+      "failed_edges": [["s1", "a"], ["s2", "a"], ["a", "mA"], ["a", "mB"], ["a", "mC"]]
+    },
+    {
+      "scenario_id": 4,
+      "label": "lower input access links fail",
+      "probability": 0.028,
+      "event_ids": ["lower_input_access"],
+      "failed_nodes": [],
+      "failed_edges": [["s1", "c"], ["s2", "c"], ["c", "mA"], ["c", "mB"], ["c", "mC"]]
+    },
+    {
+      "scenario_id": 5,
+      "label": "upper output access links fail",
+      "probability": 0.028,
+      "event_ids": ["upper_output_access"],
+      "failed_nodes": [],
+      "failed_edges": [["mA", "b"], ["mB", "b"], ["mC", "b"], ["b", "t1"], ["b", "t2"]]
+    },
+    {
+      "scenario_id": 6,
+      "label": "lower output access links fail",
+      "probability": 0.028,
+      "event_ids": ["lower_output_access"],
+      "failed_nodes": [],
+      "failed_edges": [["mA", "d"], ["mB", "d"], ["mC", "d"], ["d", "t1"], ["d", "t2"]]
+    }
+  ]
+}

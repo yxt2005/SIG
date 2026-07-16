@@ -1,0 +1,4 @@
+{
+  "description": "Scenario set 1: no failures. The loader automatically creates one normal scenario with probability 1.",
+  "scenarios": []
+}

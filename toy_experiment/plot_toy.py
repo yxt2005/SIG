@@ -351,14 +351,42 @@ def plot_toy_working_state_grid(items: list[dict], output_dir: str | Path, stem:
     if count <= 2:
         rows, cols = 1, count
     else:
-        rows, cols = 2, 2
+        cols = 2
+        rows = (count + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(7.2 * cols, 4.1 * rows))
     axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
 
     for index, (ax, item) in enumerate(zip(axes_list, items)):
         label = chr(ord("a") + index)
         caption = f"({label}) {item['title']}"
-        draw_working_state_panel(ax, item["config"], item["solution_bundle"], caption)
+        if item.get("solution_bundle") is None:
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.axis("off")
+            ax.text(
+                0.5,
+                0.55,
+                "No feasible solution",
+                ha="center",
+                va="center",
+                fontsize=14,
+                fontweight="bold",
+                color="#777777",
+            )
+            if item.get("reason"):
+                ax.text(
+                    0.5,
+                    0.42,
+                    str(item["reason"])[:90],
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="#777777",
+                    wrap=True,
+                )
+            _panel_caption(ax, caption)
+        else:
+            draw_working_state_panel(ax, item["config"], item["solution_bundle"], caption)
     for ax in axes_list[count:]:
         ax.axis("off")
 
@@ -369,6 +397,29 @@ def plot_toy_working_state_grid(items: list[dict], output_dir: str | Path, stem:
     fig.savefig(svg_path)
     plt.close(fig)
     return png_path, svg_path
+
+
+def plot_toy_equivalent_working_state_grid(config: dict, solution_bundle: dict, output_dir: str | Path):
+    """?????????????????????"""
+    all_results = solution_bundle.get("all_results", [])
+    if len(all_results) <= 1:
+        return None, None
+
+    items = []
+    for index, result in enumerate(all_results, start=1):
+        placement = ", ".join(f"{task}->{node}" for task, node in result["placement"].items())
+        items.append(
+            {
+                "title": f"Sol. {index}: {placement}",
+                "config": config,
+                "solution_bundle": {"best": result},
+            }
+        )
+    return plot_toy_working_state_grid(
+        items,
+        output_dir,
+        stem="toy_equivalent_working_state_grid",
+    )
 
 
 def plot_toy_solution(config: dict, solution_bundle: dict, output_dir: str | Path):
